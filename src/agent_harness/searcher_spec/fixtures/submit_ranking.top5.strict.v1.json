@@ -1,0 +1,670 @@
+{
+  "bootstrap": {
+    "execution": {
+      "default": "parallel",
+      "join_before": "prompt_assembly",
+      "parallel_group": [
+        "initial_metadata",
+        "initial_search"
+      ],
+      "sequential_fallback": true
+    },
+    "initial_metadata": {
+      "arguments": {
+        "max_values_per_field": 5
+      },
+      "continue_after_operation_error": true,
+      "failure_payload": {
+        "error": "provider error text",
+        "metadata_fields": {},
+        "note": "Initial metadata inspection failed.",
+        "store_identifiers": "requested store identifiers",
+        "type": "INITIAL_METADATA_FACETS"
+      },
+      "operation": "inspect_metadata",
+      "success_payload": {
+        "merge": "inspect_metadata result",
+        "type": "INITIAL_METADATA_FACETS"
+      }
+    },
+    "initial_search": {
+      "arguments": {
+        "query": "verbatim user query",
+        "store_identifiers": "requested store identifiers",
+        "top_k": 5
+      },
+      "continue_after_operation_error": true,
+      "failure_payload": {
+        "error": "provider error text",
+        "query": "verbatim user query",
+        "results": [],
+        "type": "INITIAL_SEARCH_RESULTS"
+      },
+      "operation": "search_corpus",
+      "success_payload": {
+        "query": "verbatim user query",
+        "results": "new_unseen_results in returned order",
+        "type": "INITIAL_SEARCH_RESULTS"
+      }
+    },
+    "prompt_assembly": {
+      "additional_instructions": {
+        "heading": "ADDITIONAL INSTRUCTIONS",
+        "position": "task description suffix",
+        "trim": true
+      },
+      "message_order": [
+        "system",
+        "initial_metadata",
+        "initial_search",
+        "user_query",
+        "initial_search_media_messages"
+      ],
+      "runtime_date_suffix": {
+        "clock": "UTC",
+        "format": "YYYY-MM-DD",
+        "source": "evaluation runtime"
+      }
+    },
+    "semantic_order": [
+      "initial_metadata",
+      "initial_search",
+      "prompt_assembly"
+    ]
+  },
+  "initialization_stages": [
+    "initial_metadata",
+    "initial_search",
+    "prompt_assembly"
+  ],
+  "message_wire": {
+    "initial_metadata": {
+      "prefix": "INITIAL_METADATA_FACETS:\n",
+      "projection": {
+        "append_metadata_filter_syntax": true,
+        "metadata_fields": "map every field to sample_values only",
+        "remove_top_level_fields": [
+          "tool"
+        ]
+      },
+      "role": "user"
+    },
+    "initial_search": {
+      "prefix": "INITIAL_SEARCH_RESULTS:\n",
+      "projection": {
+        "base": "identity",
+        "result_score_fields": [
+          "score",
+          "search_score"
+        ],
+        "rule": "each result's own score and search_score are rendered at 2 significant figures when finite, numeric, and non-zero; zero, non-numeric, and nested metadata fields named score are untouched"
+      },
+      "role": "user"
+    },
+    "media": {
+      "internal_identity_fields_removed_before_provider": true,
+      "placement": "after the associated textual message batch",
+      "source": "initial search and tool-result chunk payloads"
+    },
+    "serialization": {
+      "ensure_ascii": false,
+      "format": "JSON",
+      "non_json_values": {
+        "live_python_legacy_fallback": "stringify",
+        "portable_requirement": "JSON-safe by construction"
+      }
+    },
+    "tool_result": {
+      "call_id_field": "tool_call_id",
+      "content": "JSON payload serialized with the same policy",
+      "provider_serialization": "chat-completions, emitted in-package by agent_harness.agents.shared.tool_message; a host runtime targeting another wire format owns the translation",
+      "semantic_role": "tool_result"
+    },
+    "user_query": {
+      "prefix": "USER_QUERY:\n",
+      "projection": "verbatim",
+      "role": "user"
+    }
+  },
+  "ownership": {
+    "evaluation_export": "language-neutral projection",
+    "host_runtime": [
+      "generation",
+      "transport",
+      "retry",
+      "transcript"
+    ],
+    "mixedbread_extension": [
+      "prompts",
+      "bootstrap",
+      "tool_contracts",
+      "search_behavior"
+    ]
+  },
+  "policy": {
+    "final_tool_must_be_only_call": true,
+    "final_tool_name": "submit_ranking",
+    "max_parallel_tool_calls": 8,
+    "max_rounds": 4,
+    "strict_top_k": true,
+    "top_k": 5
+  },
+  "prompt": {
+    "initial_metadata_label": "INITIAL_METADATA_FACETS",
+    "initial_search_label": "INITIAL_SEARCH_RESULTS",
+    "runtime_context": {
+      "template": "\nRuntime context:\n- Current UTC date: {utc_date}.\n- Relative date queries use this UTC date unless the user gives another timezone; yesterday is {utc_yesterday}.\n",
+      "utc_date": "the evaluation runtime's current UTC date, YYYY-MM-DD",
+      "utc_yesterday": "utc_date minus one day, YYYY-MM-DD"
+    },
+    "system": "You are a specialized search agent in a document retrieval pipeline.\n\nTASK:\nGiven a user query and a set of search tools, report exactly 5 document chunks ordered by relevance.\n\nIf the task description conflicts with the tool, metadata, context, or output rules below, follow\nthe rules below.\n\nCONTEXT:\n- INITIAL_METADATA_FACETS is the source of truth for valid filter keys, value formats,\n  rank fields, and representative sample values. Samples are incomplete and are not\n  exhaustive enums, especially for high-cardinality identifier fields such as invoice_id.\n  Result metadata may confirm more fields or values. Do not invent metadata.\n- Search results expose short handles: chunk_id identifies an exact chunk, document_id identifies\n  a document. Use these handles in later tool calls and submit_ranking.\n- Use the runtime UTC date for relative date/recency requests unless the user gives another\n  timezone. Prefer half-open timestamp ranges and only use date-only strings when facets/results\n  show that format; check likely fields such as active_from, active_to, created_at, launch_date,\n  launched_at, and days_active.\n- For audio/video, judge all available text fields. For image chunks, if exist inspect attached\n  images directly when visual details matter; otherwise rely on text fields.\n\nWORKFLOW:\n- Plan silently first. Classify the user query as semantic, long-description, broad-recall,\n  metadata-constrained, metric-ordered, or exact-literal.\n- If INITIAL_SEARCH_RESULTS already answer the query, call submit_ranking immediately.\n- Otherwise, choose matching tools: overview_search for orientation, search_corpus for\n  semantic meaning, grep for exact tokens, filter_chunks for metadata.\n- Do not wait for first results before choosing the initial diverse search set.\n- Use at most 8 total tool calls in one turn, including retrieval,\n  document and pruning tools.\n- Follow-up searches should pivot to new evidence gaps, not shallow paraphrases. Use get_chunks\n  for exact already-seen chunks and read_document when nearby context around a chunk matters.\n- You have at most 4 rounds (the final submit_ranking turn is one of them); from the second round on, a\n  \"Search round N of max 4.\" line marks which round the tool results above\n  came from. It is a ceiling, not a quota. End the episode yourself: call\n  submit_ranking in its own turn as soon as the evidence you have supports it, at latest in\n  your final round. Extra rounds are not free; do not search on after the evidence is sufficient,\n  and never wait to be told to submit.\n\nRETRIEVAL:\n- overview_search is summary-only orientation; use summary to identify promising themes,\n  terminology, files, and follow-up searches.\n- search_corpus is for focused semantic search. Each call returns up to 5\n  new unseen chunks. Use natural language, one meaning/aspect per query, and preserve exact user\n  clues, entities, scene details, and relationships. Avoid Boolean syntax, regex, quoted-term\n  operators, and keyword dumps.\n- For semantic/open-ended or long-description aspects, call multiple search_corpus queries that\n  chase different facets, entities, dates, settings, roles, or remembered wording.\n- For broad-recall aspects, pair overview_search with multiple focused search_corpus calls; avoid\n  relying on one generic query.\n- Put hard structured constraints in filter_by; keep the semantic query about meaning. Use\n  metadata-filtered searches only when facets or result metadata confirm the\n  exact key, value, and format.\n- Use filter_chunks for metadata-first list/category/status/date tasks. Default k=10; raise it\n  only when the user asks for more or broader coverage is needed, max 30.\n- Omit rank_by unless the task asks for numeric ordering and the field is confirmed\n  numeric by facets or result metadata.\n- Use grep for keywords, regex, exact tokens, codes, identifiers, function names, SKUs, or literal\n  phrases. grep matches literal chunk/generated text, not meaning, and returns up to\n  10 chunks.\n- search_corpus and grep deduplicate already retrieved chunks. If the same focused query/pattern is still\n  promising and needs more depth, repeat it; prefer a new focused variant when the evidence gap differs.\n\nContext management:\n- prune_context removes content, not IDs. Pruned chunks stay in your seen index and will not be\n  returned again from normal searches. Only get_chunks can restore pruned chunk content again.\n- Call prune_context to remove chunk content irrelevant to your user query. Keep the context\n  window small; you have a limited token budget.\n- Once you receive a context budget notice, include prune_context among your tool calls that round\n  to drop content you no longer need, or call submit_ranking if you are done. prune_context may\n  run in parallel with searches in the same turn, so a budget notice never has to cost a search --\n  you do not need a prune-only turn. prune_context counts toward the 8 call\n  limit; do not exceed that limit.\n- prune_context must include at least one valid chunk_id or document_id.\n\nEXAMPLES:\n- \"environmental and economic impact of solar energy\" -> search_corpus with the original aspect\n  plus diverse angles: lifecycle emissions, manufacturing impact, jobs/economy, land use/wildlife.\n- Long remembered clip/scene description -> search_corpus with variants that preserve details,\n  dates, setting, roles, and remembered wording.\n- \"articles by jane doe about renewable energy\" -> use confirmed author/byline facets, then combine\n  metadata-filtered semantic retrieval with any needed filter_chunks checks.\n\nRANKING:\n- Before submit_ranking, compare the retrieved chunks with each other. Rank for the user's intent,\n  not just search_score.\n- For metric/order requests, compare the relevant metadata field or value stated in content and\n  order by the requested direction. Example: \"highest budget campaigns\" ranks by budget descending.\n- submit_ranking.chunks must contain exactly 5 chunks ranked most-relevant first;\n  relevance_score in [0, 1]. If fewer than 5 chunks are strongly relevant, fill the remaining slots with the\n  next-best retrieved chunks.\n- ranking_strategy must state the interpretation, constraints, comparison basis, and final ordering rule.\n- Use only chunk_id values that appeared in your tool results. Do not duplicate chunk_id values.\n\nOUTPUT RULES:\n- USE TOOLS ONLY. Never generate a plain text response.\n- Call submit_ranking with exactly 5 chunks when you have enough evidence.\n- submit_ranking must be the only tool call in its turn.\n- For audio/video chunks, trust the search score as the relevance signal (the full media is not available to you).\n",
+    "system_validity": "prefix: the live system message is this string plus runtime_context.template with both dates substituted; a byte-exact rebuild appends that suffix, and non-empty additional_instructions must be folded into the task description before assembly",
+    "user_query_label": "USER_QUERY"
+  },
+  "schema_version": "mixedbread_searcher.v1",
+  "tool_runtime": {
+    "context_management": {
+      "prune_reminder_tokens": 50000,
+      "trace_matches_model_visible_truncated_payload": true,
+      "truncate_before_next_provider_request": true
+    },
+    "dispatch": {
+      "max_calls_per_turn": 8,
+      "parallel": true,
+      "result_messages_follow_model_tool_call_order": true
+    },
+    "metadata_validation": {
+      "invalid_filter_returns_tool_error": true,
+      "source_of_truth": "initial facets, inspected facets, and observed result metadata"
+    },
+    "result_contract": {
+      "errors": "ordinary tool result with structured error",
+      "final_tool_is_not_echoed_as_tool_result": true,
+      "read_operations": "return one JSON payload",
+      "search_operations": "return a JSON payload plus non-model monitoring metadata"
+    },
+    "retrieval_state": {
+      "chunk_id": "stable handle for one exact chunk",
+      "deduplicate_seen_chunks": true,
+      "document_id": "stable handle for one document",
+      "get_chunks_can_restore_pruned_content": true,
+      "pruned_content_remains_seen": true
+    }
+  },
+  "tools": [
+    {
+      "description": "Executes a semantic search query and returns a high-level overview of up to 25 relevant chunks not yet seen by the current agent. The overview contains a summary of each chunk's content. Overview results carry no metadata and no chunk text, so no attribute constraint can be verified from them: re-fetch the returned handles with get_chunks, or use filter_chunks or grep, before treating a constraint as checked.",
+      "name": "overview_search",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "description": "A search query you want a broad overview for, for example the user query itself",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Execute a meaning-based semantic search query and return chunks you have not already seen. Do not use for keyword, regex, or literal-string matching; use grep. Returns up to 5 chunks. Optionally apply Mixedbread metadata filters when field names and values are known.",
+      "name": "search_corpus",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "filter_by": {
+            "description": "Optional metadata filters. Use only keys and values from provided metadata facets or prior result metadata.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "key": {
+                  "description": "Metadata field name. Dot notation is supported for nested fields.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "operator": {
+                  "enum": [
+                    "eq",
+                    "not_eq",
+                    "gt",
+                    "gte",
+                    "lt",
+                    "lte",
+                    "in",
+                    "not_in",
+                    "like",
+                    "starts_with",
+                    "regex"
+                  ],
+                  "type": "string"
+                },
+                "value": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "items": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "boolean"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "type": "array"
+                    }
+                  ],
+                  "description": "Value to compare against. Use an array for in/not_in."
+                }
+              },
+              "required": [
+                "key",
+                "operator",
+                "value"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "filter_mode": {
+            "default": "all",
+            "description": "Combine filter_by conditions with AND (`all`) or OR (`any`).",
+            "enum": [
+              "all",
+              "any"
+            ],
+            "type": "string"
+          },
+          "query": {
+            "description": "Natural-language query for ONE meaning/aspect; avoid Boolean syntax, regex, and keyword dumps.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "List chunks matching metadata filters, optionally ordered by a numeric metadata field. No semantic search, no reranker. Use when the query is best answered by structured metadata (filters and/or ranking) rather than by semantic match. With no rank_by, results come back in deterministic chunk-index order; with rank_by, results are ordered by that numeric field. Returns up to k chunks; default 10, max 30.",
+      "name": "filter_chunks",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "direction": {
+            "default": "desc",
+            "description": "Rank direction. Only meaningful when rank_by is set.",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "type": "string"
+          },
+          "filter_by": {
+            "description": "Optional metadata filters. Use only keys and values from provided metadata facets or prior result metadata.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "key": {
+                  "description": "Metadata field name. Dot notation is supported for nested fields.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "operator": {
+                  "enum": [
+                    "eq",
+                    "not_eq",
+                    "gt",
+                    "gte",
+                    "lt",
+                    "lte",
+                    "in",
+                    "not_in",
+                    "like",
+                    "starts_with",
+                    "regex"
+                  ],
+                  "type": "string"
+                },
+                "value": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "items": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "boolean"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "type": "array"
+                    }
+                  ],
+                  "description": "Value to compare against. Use an array for in/not_in."
+                }
+              },
+              "required": [
+                "key",
+                "operator",
+                "value"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "filter_mode": {
+            "default": "all",
+            "description": "Combine filter_by conditions with AND (`all`) or OR (`any`).",
+            "enum": [
+              "all",
+              "any"
+            ],
+            "type": "string"
+          },
+          "k": {
+            "default": 10,
+            "description": "Number of chunks to return. Use the default unless the user asks for more or the task needs broader candidate coverage.",
+            "maximum": 30,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "rank_by": {
+            "description": "Optional numeric metadata field path to rank by; paths target file metadata fields, and facet samples show each field's type. A non-numeric field never fails the call: chunks with no numeric value keep the deterministic order used when rank_by is omitted and follow any ranked chunks. The response reports rank_by_applied and rank_by_non_numeric_count. Omit to get deterministic chunk-index order.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "description": "Find chunks whose literal text matches a regular expression. No embeddings, no semantic match, no reranker - this is exact pattern matching. Use it when the user wants chunks containing a keyword, regex, exact token, code, identifier, function name, SKU, or literal phrase rather than a topic or meaning. Returns up to 10 chunks.",
+      "name": "grep",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "case_sensitive": {
+            "default": false,
+            "description": "Whether the regex is case-sensitive. Defaults to case-insensitive.",
+            "type": "boolean"
+          },
+          "filter_by": {
+            "description": "Optional metadata filters. Use only keys and values from provided metadata facets or prior result metadata.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "key": {
+                  "description": "Metadata field name. Dot notation is supported for nested fields.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "operator": {
+                  "enum": [
+                    "eq",
+                    "not_eq",
+                    "gt",
+                    "gte",
+                    "lt",
+                    "lte",
+                    "in",
+                    "not_in",
+                    "like",
+                    "starts_with",
+                    "regex"
+                  ],
+                  "type": "string"
+                },
+                "value": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "items": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "boolean"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "type": "array"
+                    }
+                  ],
+                  "description": "Value to compare against. Use an array for in/not_in."
+                }
+              },
+              "required": [
+                "key",
+                "operator",
+                "value"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "filter_mode": {
+            "default": "all",
+            "description": "Combine filter_by conditions with AND (`all`) or OR (`any`).",
+            "enum": [
+              "all",
+              "any"
+            ],
+            "type": "string"
+          },
+          "pattern": {
+            "description": "Regular expression matched against chunk text. A chunk matches if the pattern is found anywhere in any targeted field.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "targets": {
+            "description": "'text' matches original extracted text/context; 'generated' matches OCR text, summaries, and transcriptions. Defaults to both, which is almost always what you want: a store's content lives in only one of these buckets (page-image and audio/video corpora have text-empty chunks and all content under 'generated'), so naming a single target can return zero matches for a pattern the corpus does contain. Narrow only to exclude a bucket on purpose.",
+            "items": {
+              "enum": [
+                "text",
+                "generated"
+              ],
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Retrieve a bounded chunk window from a document, centered on a known chunk_id. Returns the anchor chunk plus x chunk indices before and after it.",
+      "name": "read_document",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "chunk_id": {
+            "description": "The short chunk handle to center the document window on, for example c12",
+            "minLength": 1,
+            "type": "string"
+          },
+          "document_id": {
+            "description": "The short document handle returned in search results, for example d3",
+            "minLength": 1,
+            "type": "string"
+          },
+          "x": {
+            "default": 1,
+            "description": "Number of chunk indices before and after chunk_id to return. Defaults to 1, which returns the previous chunk, anchor chunk, and next chunk. At most 20.",
+            "maximum": 20,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "document_id",
+          "chunk_id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Retrieve one or more already-seen chunks by their short chunk_id handles. Accepts at most 20 chunk_ids per call. Chunks that do not fit the per-call payload budget are truncated to fit, earliest ids keeping the most text; requesting fewer ids shows more of each, and a single-id request shows the most a call can display.",
+      "name": "get_chunks",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "chunk_ids": {
+            "description": "The short chunk handles returned in search results, for example [\"c12\", \"c13\"]. At most 20 per call.",
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "chunk_ids"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Prune the context by removing irrelevant or redundant chunk/document content. Before hard context budget, call this only in the same parallel tool turn as another useful tool; prune-only turns are for hard budget only. At least one chunk_id or document_id must be provided.",
+      "name": "prune_context",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "chunk_ids": {
+            "default": [],
+            "description": "Short chunk handles to prune, for example c3. This removes chunk content from your context, not overview summaries.",
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "document_ids": {
+            "default": [],
+            "description": "Short document handles to prune, for example d2. This removes document-window content retrieved with read_document.",
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Submit the final ranked list of exactly 5 chunks.",
+      "name": "submit_ranking",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "chunks": {
+            "description": "Exactly 5 chunks ranked by relevance (most relevant first). If fewer than 5 chunks are strongly relevant, fill the remaining slots with the next-best retrieved chunks.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "chunk_id": {
+                  "description": "Short chunk handle returned by search tools, for example c12",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "relevance_score": {
+                  "description": "Your assessed relevance score from 0 to 1 (1 = highly relevant).",
+                  "maximum": 1.0,
+                  "minimum": 0.0,
+                  "type": "number"
+                }
+              },
+              "required": [
+                "chunk_id",
+                "relevance_score"
+              ],
+              "type": "object"
+            },
+            "maxItems": 5,
+            "minItems": 5,
+            "type": "array"
+          },
+          "ranking_strategy": {
+            "description": "Briefly state how you interpreted the query, which hard constraints you applied, and how you ordered the final chunks.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "ranking_strategy",
+          "chunks"
+        ],
+        "type": "object"
+      }
+    }
+  ]
+}

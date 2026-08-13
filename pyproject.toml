@@ -1,0 +1,80 @@
+[project]
+name = "toast-harness"
+version = "0.1.0"
+description = "Harness for the Mixedbread fast search agent: retrieval tools, agent loop, exact token accounting."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Mixedbread" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+
+# Exactly what `agent_harness` imports.
+dependencies = [
+    # The default token-counter backend; every install ships it. The version guard
+    # in agent_harness.token_counter must stay in sync with this range.
+    "gigatoken>=0.10,<0.11",
+    # agent_harness.errors builds httpx responses for in-process bindings; it is
+    # imported at package import time, so it must be a declared dependency even
+    # though the mixedbread SDK also pulls it transitively today.
+    "httpx>=0.27",
+    # The retrieval SDK and the exception types agent_harness.errors classifies by.
+    "mixedbread>=0.54",
+    "pydantic>=2.8",
+    "python-dotenv>=1.0",
+    # Interruptible matching (timeout=/concurrent=) for model-authored patterns in
+    # the grep clip pass and the filter `regex` operator; stdlib re cannot time out.
+    "regex>=2024.5",
+]
+
+[project.urls]
+Repository = "https://github.com/mixedbread-ai/toast-harness"
+Issues = "https://github.com/mixedbread-ai/toast-harness/issues"
+
+# transformers is not a runtime dep: it backs the token counter's HF parity
+# reference and fallback path that tests exercise. Pinned to the version CI
+# installs so a local run and the gate agree.
+[dependency-groups]
+dev = [
+    # Validates the exported searcher contract against its bundled JSON Schema.
+    # Test-only: agent_harness itself never imports it.
+    "jsonschema==4.25.1",
+    "pytest==9.0.3",
+    "pytest-asyncio==1.3.0",
+    "transformers==5.13.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = ["agent_harness"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [".venv", ".venv-gate", "dist", "build"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "TID", "PL", "PT"]
+ignore = ["E501", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR2004"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S101", "PT018"]
+"**/__init__.py" = ["F401"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+addopts = ["-ra", "--strict-config", "--strict-markers"]
+testpaths = ["tests"]
+xfail_strict = true
+asyncio_mode = "auto"

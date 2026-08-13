@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      # Ruff is pinned: an unpinned lint job turns an upstream rule promotion
+      # into a red build on an unrelated PR. Bump deliberately.
+      - name: Lint
+        run: uvx ruff@0.16.1 check .
+      - name: Format check
+        run: uvx ruff@0.16.1 format --check .
+      - name: Lockfile is current
+        run: uv lock --check
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel
+        run: uv build --wheel
+
+      # The gate runs against the *installed distribution*, never against src/ --
+      # that is what makes it a packaging test and not just a test run. No
+      # --prerelease: every dependency of this package resolves from a release.
+      # transformers is not a runtime dep: it backs the token counter's HF parity
+      # reference and fallback path. gigatoken is one, and arrives with the wheel.
+      - name: Fresh venv + wheel install
+        run: |
+          uv venv /tmp/gate --python 3.12
+          uv pip install --python /tmp/gate/bin/python \
+            dist/*.whl pytest==9.0.3 pytest-asyncio==1.3.0 \
+            transformers==5.13.0 jsonschema==4.25.1
+
+      # jsonschema validates the exported searcher contract against its bundled
+      # schema. It is a dev dependency, so it must be named here too: the gate
+      # venv is built from this explicit list, not from [dependency-groups].
+      # The job sets no environment variable of its own: a bare import that
+      # reaches a poisoned module or the network must fail here, and it must
+      # fail under whatever environment a runner happens to carry.
+      - name: Import safety
+        run: /tmp/gate/bin/python -m pytest -q tests/test_import_safety.py
+
+      # The harness gate: the whole suite, and it is expected fully green.
+      - name: Harness gate
+        run: /tmp/gate/bin/python -m pytest -q tests/agent_harness

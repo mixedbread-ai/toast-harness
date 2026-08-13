@@ -1,0 +1,643 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mixedbread.com/schemas/mixedbread_searcher.v1.schema.json",
+  "title": "Mixedbread searcher contract v1",
+  "description": "Language-neutral prompt, bootstrap, tool, and search-policy contract for host agent runtimes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "ownership",
+    "initialization_stages",
+    "prompt",
+    "bootstrap",
+    "message_wire",
+    "tools",
+    "tool_runtime",
+    "policy"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "mixedbread_searcher.v1"
+    },
+    "ownership": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host_runtime",
+        "mixedbread_extension",
+        "evaluation_export"
+      ],
+      "properties": {
+        "host_runtime": {
+          "const": [
+            "generation",
+            "transport",
+            "retry",
+            "transcript"
+          ]
+        },
+        "mixedbread_extension": {
+          "const": [
+            "prompts",
+            "bootstrap",
+            "tool_contracts",
+            "search_behavior"
+          ]
+        },
+        "evaluation_export": {
+          "const": "language-neutral projection"
+        }
+      }
+    },
+    "initialization_stages": {
+      "const": [
+        "initial_metadata",
+        "initial_search",
+        "prompt_assembly"
+      ]
+    },
+    "prompt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "system",
+        "system_validity",
+        "runtime_context",
+        "initial_metadata_label",
+        "initial_search_label",
+        "user_query_label"
+      ],
+      "properties": {
+        "system": {
+          "type": "string",
+          "minLength": 1
+        },
+        "system_validity": {
+          "type": "string",
+          "minLength": 1
+        },
+        "runtime_context": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "template",
+            "utc_date",
+            "utc_yesterday"
+          ],
+          "properties": {
+            "template": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^(?=[\\s\\S]*\\{utc_date\\})(?=[\\s\\S]*\\{utc_yesterday\\})"
+            },
+            "utc_date": {
+              "type": "string",
+              "minLength": 1
+            },
+            "utc_yesterday": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "initial_metadata_label": {
+          "const": "INITIAL_METADATA_FACETS"
+        },
+        "initial_search_label": {
+          "const": "INITIAL_SEARCH_RESULTS"
+        },
+        "user_query_label": {
+          "const": "USER_QUERY"
+        }
+      }
+    },
+    "bootstrap": {
+      "$ref": "#/$defs/fastBootstrap"
+    },
+    "message_wire": {
+      "$ref": "#/$defs/fastMessageWire"
+    },
+    "tools": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "items": {
+        "$ref": "#/$defs/canonicalTool"
+      }
+    },
+    "tool_runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dispatch",
+        "retrieval_state",
+        "metadata_validation",
+        "result_contract",
+        "context_management"
+      ],
+      "properties": {
+        "dispatch": {
+          "$ref": "#/$defs/descriptionMap"
+        },
+        "retrieval_state": {
+          "$ref": "#/$defs/descriptionMap"
+        },
+        "metadata_validation": {
+          "$ref": "#/$defs/descriptionMap"
+        },
+        "result_contract": {
+          "$ref": "#/$defs/descriptionMap"
+        },
+        "context_management": {
+          "$ref": "#/$defs/descriptionMap"
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "final_tool_name",
+        "final_tool_must_be_only_call",
+        "max_parallel_tool_calls",
+        "max_rounds",
+        "top_k",
+        "strict_top_k"
+      ],
+      "properties": {
+        "final_tool_name": {
+          "const": "submit_ranking"
+        },
+        "final_tool_must_be_only_call": {
+          "type": "boolean"
+        },
+        "max_parallel_tool_calls": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_rounds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "top_k": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "strict_top_k": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "jsonValue": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/jsonValue"
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/jsonValue"
+          }
+        }
+      ]
+    },
+    "payloadTemplate": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "$ref": "#/$defs/jsonValue"
+      }
+    },
+    "runtimePromptRules": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "message_order",
+        "runtime_date_suffix",
+        "additional_instructions"
+      ],
+      "properties": {
+        "message_order": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "runtime_date_suffix": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "clock",
+            "format",
+            "source"
+          ],
+          "properties": {
+            "clock": {
+              "const": "UTC"
+            },
+            "format": {
+              "const": "YYYY-MM-DD"
+            },
+            "source": {
+              "const": "evaluation runtime"
+            }
+          }
+        },
+        "additional_instructions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "position",
+            "heading",
+            "trim"
+          ],
+          "properties": {
+            "position": {
+              "const": "task description suffix"
+            },
+            "heading": {
+              "const": "ADDITIONAL INSTRUCTIONS"
+            },
+            "trim": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "initialMetadataOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "arguments",
+        "success_payload",
+        "failure_payload",
+        "continue_after_operation_error"
+      ],
+      "properties": {
+        "operation": {
+          "const": "inspect_metadata"
+        },
+        "arguments": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "max_values_per_field"
+          ],
+          "properties": {
+            "max_values_per_field": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "success_payload": {
+          "$ref": "#/$defs/payloadTemplate"
+        },
+        "failure_payload": {
+          "$ref": "#/$defs/payloadTemplate"
+        },
+        "continue_after_operation_error": {
+          "type": "boolean"
+        }
+      }
+    },
+    "initialSearchOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "arguments",
+        "success_payload",
+        "failure_payload",
+        "continue_after_operation_error"
+      ],
+      "properties": {
+        "operation": {
+          "const": "search_corpus"
+        },
+        "arguments": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "query",
+            "top_k",
+            "store_identifiers"
+          ],
+          "properties": {
+            "query": {
+              "type": "string"
+            },
+            "top_k": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "store_identifiers": {
+              "type": "string"
+            }
+          }
+        },
+        "success_payload": {
+          "$ref": "#/$defs/payloadTemplate"
+        },
+        "failure_payload": {
+          "$ref": "#/$defs/payloadTemplate"
+        },
+        "continue_after_operation_error": {
+          "type": "boolean"
+        }
+      }
+    },
+    "fastBootstrap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "semantic_order",
+        "execution",
+        "initial_metadata",
+        "initial_search",
+        "prompt_assembly"
+      ],
+      "properties": {
+        "semantic_order": {
+          "const": [
+            "initial_metadata",
+            "initial_search",
+            "prompt_assembly"
+          ]
+        },
+        "execution": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "default",
+            "parallel_group",
+            "join_before",
+            "sequential_fallback"
+          ],
+          "properties": {
+            "default": {
+              "const": "parallel"
+            },
+            "parallel_group": {
+              "const": [
+                "initial_metadata",
+                "initial_search"
+              ]
+            },
+            "join_before": {
+              "const": "prompt_assembly"
+            },
+            "sequential_fallback": {
+              "const": true
+            }
+          }
+        },
+        "initial_metadata": {
+          "$ref": "#/$defs/initialMetadataOperation"
+        },
+        "initial_search": {
+          "$ref": "#/$defs/initialSearchOperation"
+        },
+        "prompt_assembly": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/runtimePromptRules"
+            },
+            {
+              "type": "object",
+              "required": [
+                "message_order"
+              ],
+              "properties": {
+                "message_order": {
+                  "const": [
+                    "system",
+                    "initial_metadata",
+                    "initial_search",
+                    "user_query",
+                    "initial_search_media_messages"
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "modelVisibleMessageProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "prefix",
+        "projection"
+      ],
+      "properties": {
+        "role": {
+          "const": "user"
+        },
+        "prefix": {
+          "type": "string"
+        },
+        "projection": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/jsonValue"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "serializationPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "ensure_ascii",
+        "non_json_values"
+      ],
+      "properties": {
+        "format": {
+          "const": "JSON"
+        },
+        "ensure_ascii": {
+          "const": false
+        },
+        "non_json_values": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "portable_requirement",
+            "live_python_legacy_fallback"
+          ],
+          "properties": {
+            "portable_requirement": {
+              "const": "JSON-safe by construction"
+            },
+            "live_python_legacy_fallback": {
+              "const": "stringify"
+            }
+          }
+        }
+      }
+    },
+    "toolResultWire": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "semantic_role",
+        "provider_serialization",
+        "call_id_field",
+        "content"
+      ],
+      "properties": {
+        "semantic_role": {
+          "const": "tool_result"
+        },
+        "provider_serialization": {
+          "type": "string",
+          "minLength": 1
+        },
+        "call_id_field": {
+          "const": "tool_call_id"
+        },
+        "content": {
+          "type": "string"
+        }
+      }
+    },
+    "mediaWire": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "placement",
+        "internal_identity_fields_removed_before_provider"
+      ],
+      "properties": {
+        "source": {
+          "type": "string"
+        },
+        "placement": {
+          "type": "string"
+        },
+        "internal_identity_fields_removed_before_provider": {
+          "type": "boolean"
+        }
+      }
+    },
+    "fastMessageWire": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "serialization",
+        "initial_metadata",
+        "initial_search",
+        "user_query",
+        "tool_result",
+        "media"
+      ],
+      "properties": {
+        "serialization": {
+          "$ref": "#/$defs/serializationPolicy"
+        },
+        "initial_metadata": {
+          "$ref": "#/$defs/modelVisibleMessageProjection"
+        },
+        "initial_search": {
+          "$ref": "#/$defs/modelVisibleMessageProjection"
+        },
+        "user_query": {
+          "$ref": "#/$defs/modelVisibleMessageProjection"
+        },
+        "tool_result": {
+          "$ref": "#/$defs/toolResultWire"
+        },
+        "media": {
+          "$ref": "#/$defs/mediaWire"
+        }
+      }
+    },
+    "canonicalTool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "description",
+        "parameters"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "parameters": {
+          "type": "object",
+          "required": [
+            "type",
+            "properties"
+          ],
+          "properties": {
+            "type": {
+              "const": "object"
+            },
+            "properties": {
+              "type": "object"
+            }
+          },
+          "additionalProperties": true
+        }
+      }
+    },
+    "descriptionMap": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "integer"
+          },
+          {
+            "type": "string"
+          }
+        ]
+      }
+    }
+  }
+}
