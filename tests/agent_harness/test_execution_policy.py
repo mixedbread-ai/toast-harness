@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Any
 
@@ -168,7 +169,10 @@ def test_fast_searcher_uses_injected_generation_fn(monkeypatch: pytest.MonkeyPat
     assert result["chunks"][0]["chunk_id"] == captured["chunk_id"]
     assert result["chunks"][0]["relevance_score"] == 1.0
     assert "submit_ranking" in captured["tool_names"]
-    assert captured["completion_config"] is harness_config.SEARCHER_AGENT_CONFIG
+    # A copy, never the module-level object: a seam that applies the force-submit
+    # policy in place must not be able to leak it into later rounds.
+    assert captured["completion_config"] == harness_config.SEARCHER_AGENT_CONFIG
+    assert captured["completion_config"] is not harness_config.SEARCHER_AGENT_CONFIG
     assert captured["force_submit"] is False
     # forced_tool_name is only meaningful when force_submit is True. Hard-budget
     # turns use the runtime verifier instead of forcing one specific tool.
@@ -1044,11 +1048,12 @@ async def test_fast_search_submit_ranking_trace_output_includes_mixedbread_refs(
 
     tool_round = await searcher_runtime._handle_searcher_tool_calls(
         [tool_call],
-        agent_iteration=1,
+        _round_config(
+            index,
+            initial_metadata_facets={"type": "INITIAL_METADATA_FACETS", "metadata_fields": {}},
+        ),
+        iteration=1,
         messages=[],
-        index=index,
-        store_identifiers=["store-a"],
-        initial_metadata_facets={"type": "INITIAL_METADATA_FACETS", "metadata_fields": {}},
     )
 
     tool_trace = tool_round.trace
@@ -1087,10 +1092,9 @@ async def test_tool_bridge_preserves_full_history_baseline_when_larger_than_usag
 
     await searcher_runtime._handle_searcher_tool_calls(
         [_fake_tool_call("call_unknown", "unknown_tool", {})],
-        agent_iteration=1,
+        _round_config(searcher_runtime.ChunkIndex()),
+        iteration=1,
         messages=messages,
-        index=searcher_runtime.ChunkIndex(),
-        store_identifiers=["store-a"],
         context_tokens_baseline=100,
     )
 
@@ -1122,10 +1126,9 @@ async def test_tool_bridge_preserves_server_usage_baseline_when_larger_than_hist
 
     await searcher_runtime._handle_searcher_tool_calls(
         [_fake_tool_call("call_unknown", "unknown_tool", {})],
-        agent_iteration=1,
+        _round_config(searcher_runtime.ChunkIndex()),
+        iteration=1,
         messages=messages,
-        index=searcher_runtime.ChunkIndex(),
-        store_identifiers=["store-a"],
         context_tokens_baseline=100,
     )
 
@@ -1157,10 +1160,9 @@ async def test_tool_bridge_pruning_forces_full_history_recount(
                 {"chunk_ids": [chunk_id], "document_ids": []},
             )
         ],
-        agent_iteration=1,
+        _round_config(index),
+        iteration=1,
         messages=messages,
-        index=index,
-        store_identifiers=["store-a"],
         context_tokens_baseline=100,
     )
 
@@ -1195,10 +1197,9 @@ async def test_model_issued_searches_remain_independent_parallel_calls_in_prompt
 
     await searcher_runtime._handle_searcher_tool_calls(
         calls,
-        agent_iteration=1,
+        _round_config(searcher_runtime.ChunkIndex()),
+        iteration=1,
         messages=messages,
-        index=searcher_runtime.ChunkIndex(),
-        store_identifiers=["store-a"],
     )
 
     assert set(queries) == {"query 0", "query 1", "query 2"}
@@ -1297,6 +1298,24 @@ def _invalid_required_tool_response(response_id: str) -> Any:
             "request": {"model": "gpt-test", "input": [], "store": False},
             "response": {"id": response_id, "output": []},
         },
+    )
+
+
+def _round_config(
+    index: searcher_runtime.ChunkIndex,
+    *,
+    initial_metadata_facets: Mapping[str, Any] | None = None,
+) -> searcher_runtime._RoundConfig:
+    """Per-rollout bindings for driving one tool round directly."""
+    return searcher_runtime._RoundConfig(
+        index=index,
+        store_identifiers=["store-a"],
+        client=None,
+        api_key=None,
+        api_key_env=None,
+        initial_metadata_facets=initial_metadata_facets,
+        top_k=None,
+        strict_top_k=False,
     )
 
 

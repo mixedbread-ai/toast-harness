@@ -21,6 +21,7 @@ from .retrieval import (
     StoreFiles,
     Stores,
 )
+from .schemas import AnswerMode
 from .sync_api import (
     TOOL_FUNCTIONS,
     filter_chunks,
@@ -44,6 +45,7 @@ from .versions import (
 
 __all__ = [
     "TOOL_FUNCTIONS",
+    "AnswerMode",
     "AsyncGenerationFn",
     "AsyncRetrievalClient",
     "AsyncStoreFiles",

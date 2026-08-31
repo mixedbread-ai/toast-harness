@@ -114,21 +114,27 @@ def _runtime_context(as_of: date | None = None) -> str:
 def over_budget_message(
     estimated_tokens: int,
     *,
-    final_tool_name: str = "submit_ranking",
+    final_tool_name: str | None = "submit_ranking",
 ) -> dict[str, Any]:
     """Reminder sent on any round whose prompt is over the prune trigger.
 
     The same message fires whether the prompt is just over the trigger or
     already at the truncation ceiling; it asks for a parallel prune rather
-    than a forced solo prune turn.
+    than a forced solo prune turn. ``final_tool_name=None`` is the plain-text
+    answer protocol, which has no final tool to name.
     """
+    finish_instruction = (
+        f"or call {final_tool_name} if you are done."
+        if final_tool_name is not None
+        else "or reply with your final answer if you are done."
+    )
     return {
         "role": "user",
         "content": (
             "Context budget notice: your current prompt is estimated at "
             f"{estimated_tokens} tokens, over your context budget. Include prune_context "
             "among your tool calls this round to remove content you no longer need -- it "
-            f"may run in parallel with other tools -- or call {final_tool_name} if you are done."
+            f"may run in parallel with other tools -- {finish_instruction}"
         ),
     }
 
@@ -148,34 +154,47 @@ def round_notice_message(
     max_rounds: int,
     *,
     label: str = "Search round",
+    final_tool_name: str | None = "submit_ranking",
 ) -> dict[str, Any]:
     """Round header appended from round 2 on, after the previous round's tool results.
 
     Round 1 is skipped deliberately: its prompt is the prefix shared by every
     rollout of a query, and there are no prior tool results to label yet.
 
-    AGENT_HARNESS_FINAL_ROUND_NOTICE=1 appends a submit pre-notice on the final round.
+    AGENT_HARNESS_FINAL_ROUND_NOTICE=1 appends a protocol-aware pre-notice on
+    the final round; ``final_tool_name=None`` is the plain-text answer protocol.
     """
     content = round_label(round_index, max_rounds, label=label)
     if round_index >= max_rounds and os.environ.get("AGENT_HARNESS_FINAL_ROUND_NOTICE", "") in (
         "1",
         "true",
     ):
-        content += (
-            " This is your final search round: after these tool calls return, you "
-            "must make your submit_ranking call. Prioritize confirming your best "
-            "candidates now."
-        )
+        content += _final_round_notice(final_tool_name)
     return {
         "role": "user",
         "content": content,
     }
 
 
+def _final_round_notice(final_tool_name: str | None) -> str:
+    if final_tool_name is None:
+        return (
+            " This is your final search round: reply with your final answer now if "
+            "the evidence is sufficient; otherwise prioritize confirming your best "
+            "evidence with the tools available this round."
+        )
+    return (
+        " This is your final search round: after these tool calls return, you "
+        f"must make your {final_tool_name} call. Prioritize confirming your best "
+        "candidates now."
+    )
+
+
 def force_submit_message(
     *,
     top_k: int | None = None,
     strict_top_k: bool = False,
+    require_answer: bool = False,
     round_index: int | None = None,
     max_rounds: int | None = None,
     label: str = "Search round",
@@ -183,19 +202,50 @@ def force_submit_message(
     # Emphasise EXACTLY ONE submit_ranking call: the searcher loop rejects a turn
     # with any other tool or multiple calls, and thinking-enabled runs otherwise
     # tend to keep searching here instead of submitting.
+    answer_clause = " and your final answer in the answer field" if require_answer else ""
     if strict_top_k and top_k is not None:
         content = (
             "You have reached the search limit. Do NOT search further. You must now make "
             f"EXACTLY ONE submit_ranking tool call (no other tools, no parallel calls) with "
-            f"ranking_strategy and exactly {top_k} chunks."
+            f"ranking_strategy and exactly {top_k} chunks{answer_clause}."
         )
     else:
         content = (
             "You have reached the search limit. Do NOT search further. You must now make "
             "EXACTLY ONE submit_ranking tool call (no other tools, no parallel calls) with "
-            "ranking_strategy and your final ranked chunk list. Use an empty list only if "
-            "no relevant chunks exist."
+            f"ranking_strategy and your final ranked chunk list{answer_clause}. Use an "
+            "empty list only if no relevant chunks exist."
         )
+    return _forced_turn_message(
+        content, round_index=round_index, max_rounds=max_rounds, label=label
+    )
+
+
+def force_answer_message(
+    *,
+    round_index: int | None = None,
+    max_rounds: int | None = None,
+    label: str = "Search round",
+) -> dict[str, Any]:
+    """The plain-text counterpart of :func:`force_submit_message`."""
+    content = (
+        "You have reached the search limit. Do NOT search further. You must now reply "
+        "with your final answer to the user query as plain text, with NO tool calls. "
+        "Base it only on retrieved evidence; if the evidence is insufficient to answer, "
+        "say so."
+    )
+    return _forced_turn_message(
+        content, round_index=round_index, max_rounds=max_rounds, label=label
+    )
+
+
+def _forced_turn_message(
+    content: str,
+    *,
+    round_index: int | None,
+    max_rounds: int | None,
+    label: str,
+) -> dict[str, Any]:
     if round_index is not None and max_rounds is not None:
         content = f"{round_label(round_index, max_rounds, label=label)} {content}"
     return {

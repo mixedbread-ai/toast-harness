@@ -271,11 +271,19 @@ def submit_ranking_tool(
     strict: bool = False,
     top_k: int | None = None,
     strict_top_k: bool = False,
+    require_answer: bool = False,
 ) -> dict[str, Any]:
+    """The final tool's schema for one rollout.
+
+    ``require_answer`` (answer_mode="submit_ranking") adds a mandatory
+    ``answer`` string and says so in the description.
+    """
     tool = deepcopy(SUBMIT_RANKING_TOOL)
     exact_top_k = strict_top_k and top_k is not None
     if exact_top_k:
         tool["function"]["description"] = f"Submit the final ranked list of exactly {top_k} chunks."
+    if require_answer:
+        _require_answer(tool, chunk_count=f"exactly {top_k} chunks" if exact_top_k else "chunks")
     chunks_schema = tool["function"]["parameters"]["properties"]["chunks"]
     if exact_top_k:
         chunks_schema["description"] = (
@@ -290,3 +298,20 @@ def submit_ranking_tool(
     if strict:
         tool["function"]["strict"] = True
     return tool
+
+
+def _require_answer(tool: dict[str, Any], *, chunk_count: str) -> None:
+    tool["function"]["description"] = (
+        f"Submit the final ranked list of {chunk_count} and your final answer to the user query."
+    )
+    parameters = tool["function"]["parameters"]
+    parameters["properties"]["answer"] = {
+        "type": "string",
+        "minLength": 1,
+        "description": (
+            "Your final answer to the original user query, based only on retrieved "
+            "evidence. Required on every submit_ranking call: give your single best "
+            "answer even when uncertain; if the evidence is insufficient to answer, say so."
+        ),
+    }
+    parameters["required"].append("answer")

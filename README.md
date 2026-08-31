@@ -3,9 +3,9 @@
 The harness for the Mixedbread fast search agent. It ships the retrieval tool
 surface over a Mixedbread store (`search_corpus`, `grep`, `get_chunks`,
 `read_document`, `filter_chunks`, `prune_context`, `submit_ranking`), the agent loop
-that drives those tools to a ranked answer, and exact token accounting so context
-budgeting and payload truncation measure what the model actually sees rather than a
-`chars/4` guess. One import name: `agent_harness`.
+that drives those tools to a ranked list and/or an answer, and exact token
+accounting so context budgeting and payload truncation measure what the model
+actually sees. One import name: `agent_harness`.
 
 ## Install
 
@@ -16,8 +16,7 @@ pip install toast-harness
 ## Quickstart
 
 Wired against any OpenAI-compatible served model. `examples/browsecomp/run.py` is
-a complete client of this shape, including the sampling parameters a real run
-would set.
+a complete client of this shape.
 
 ```python
 import openai
@@ -65,39 +64,48 @@ agent = result["openai"]["metadata"]["agent"]
 print(agent["total_tokens"], agent["rounds_executed"])  # exact accounting
 ```
 
-Both provider seams are injected; the harness bundles neither. Generation is a
-required `generation_fn` — it receives the messages, the tool schemas, and the
-completion config, and returns a chat-completion-shaped response. Retrieval
-resolves a Mixedbread SDK client from `MXBAI_API_KEY` unless you pass a `client`
-of your own (see below).
+Both provider seams are injected; the harness bundles neither. `generation_fn`
+receives the messages, the tool schemas, and the completion config, and returns a
+chat-completion-shaped response. Retrieval resolves a Mixedbread SDK client from
+`MXBAI_API_KEY` unless you pass a `client=` of your own -- anything structurally
+matching `agent_harness.RetrievalClient`, the SDK client or an in-process
+implementation alike.
 
-Every rollout installs the policy tokenizer at its entry point — from
-`AGENT_HARNESS_TOKENIZER`, else the model name in `SEARCHER_AGENT_CONFIG` — so
-context budgeting and payload truncation count what the model will actually see.
-Which counter measured a rollout is recorded on it, as
-`openai.metadata.token_counter_mode` (`exact-gigatoken`, `exact`, or
-`chars-heuristic`); exact counting is required by default: set
-`AGENT_HARNESS_REQUIRE_EXACT_TOKENIZER=0` to instead allow a rollout whose
-tokenizer would not load to run on the `chars/4` estimate.
+## Answer modes
 
-Pass `client=` to run the retrieval tools against your own store client instead of
-the public API. Anything structurally matching `agent_harness.RetrievalClient` works
-— the SDK client does, and so does an in-process implementation, which is how the
-harness runs inside a service that already owns the store layer:
+`answer_mode` picks how the episode ends. It is accepted by every entry point
+(`run_searcher`, `fast_agentic_search`, and the `aio` coroutines).
 
 ```python
-result = agent_harness.run_searcher(
-    query, store_identifiers=[store], client=my_store_client, generation_fn=generate
-)
+# 1. Plain ranking (default): the agent ends with a submit_ranking call.
+result = agent_harness.run_searcher(query, store_identifiers=[store], generation_fn=generate)
+result["retrieval"]["ranked_ids"]
+
+# 2. Ranking plus answer: submit_ranking carries a required `answer` argument.
+result = agent_harness.run_searcher(..., answer_mode="submit_ranking")
+result["retrieval"]["ranked_ids"], result["answer"]
+
+# 3. Answer only: no submit_ranking tool at all. The agent searches, then ends
+#    the episode with a plain-text reply -- that text is the answer.
+result = agent_harness.run_searcher(..., answer_mode="plain_text")
+result["answer"]  # no ranking, so top_k / strict_top_k must stay unset
 ```
+
+- `"none"` leaves prompts, tool schemas, and loop behavior byte-identical to the
+  harness before the knob existed.
+- `"submit_ranking"` makes a submission without an answer a validation error the
+  agent gets a correction round for, forced submits included.
+- `"plain_text"` withdraws `submit_ranking`; a turn with no tool calls ends the
+  run. When the round budget runs out without an answer, the harness forces an
+  answer turn the same way it forces a ranking.
+
+Every record carries `answer_mode`; `answer` (top-level and under `retrieval`) is
+present only when the mode produced one.
 
 ## Async
 
-The agent loop is async-native; the sync API above is a compatibility
-surface that adapts sync seams (the SDK client included) onto it per call.
-Async services that run the harness in-process on their own event loop
-consume the coroutines directly and inject async seams, with no thread
-bridging:
+The loop is async-native; the sync API adapts sync seams onto it per call. Async
+services consume the coroutines directly and inject async seams:
 
 ```python
 from agent_harness import aio
@@ -107,22 +115,26 @@ result = await aio.run_fast_agentic_search(
     store_identifiers=[store],
     client=my_async_store_client,  # agent_harness.AsyncRetrievalClient
     generation_fn=my_async_generate,  # agent_harness.AsyncGenerationFn
+    answer_mode="plain_text",
 )
 
 async for event in aio.stream_fast_agentic_search(...):  # progress events
     ...
 ```
 
-Every event stream ends with exactly one terminal event -- ``RolloutCompleted``,
-``RolloutFailed`` (whose error also re-raises from the iterator) or
-``RolloutCancelled`` -- so consumers that account rollouts can key off it.
-Cancelling the consuming task cancels the rollout and its in-flight seam
-awaits. Parallel tool calls fan out with ``asyncio.gather``; bulk token
-counting (history baselines, round truncation) runs off the event loop, while
-the small per-call payload budget checks count inline. Per-rollout knobs travel as
-``tuning=HarnessTuning(...)`` instead of process-global env vars, and
-``agent_harness.testing.verify_retrieval_client`` conformance-tests a
-retrieval binding by driving one real rollout against it.
+Every event stream ends with exactly one terminal event (`RolloutCompleted`,
+`RolloutFailed`, or `RolloutCancelled`). Per-rollout knobs travel as
+`tuning=HarnessTuning(...)`, and `agent_harness.testing.verify_retrieval_client`
+conformance-tests a retrieval binding by driving one real rollout against it.
+
+## Token counting
+
+Every rollout installs the policy tokenizer at its entry point -- from
+`AGENT_HARNESS_TOKENIZER`, else the model name in `SEARCHER_AGENT_CONFIG` -- so
+budgets count what the model will see. The counter used is recorded on the
+record as `openai.metadata.token_counter_mode`; a rollout whose tokenizer will
+not load fails unless `AGENT_HARNESS_REQUIRE_EXACT_TOKENIZER=0` allows the
+`chars/4` estimate.
 
 ## Running BrowseComp-Plus
 
@@ -133,26 +145,26 @@ scores the resulting rankings. With a served model up:
 export MXBAI_API_KEY=...                       # retrieval
 export AGENT_HARNESS_TOKENIZER=/models/my-policy-model
 export TOAST_MODEL_BASE_URL=http://127.0.0.1:30000/v1
+export TOAST_ANSWER_MODE=none                  # or submit_ranking / plain_text
 python examples/browsecomp/run.py out/ queries.json
 ```
 
-`queries.json` is a list of `{"query_id", "query", "relevant_ids"}` rows — query text
-and evidence-document ids from the BrowseComp-Plus set. Score the rollouts with
-`examples/browsecomp/scoring.py`:
+`queries.json` is a list of `{"query_id", "query", "relevant_ids"}` rows.
+`examples/browsecomp/scoring.py` scores a rollout's ranking:
 `score(rollout["retrieval"], row["relevant_ids"])` returns nDCG@10 and recall@10.
 
 ## Configuration
 
 | Variable | Effect |
 | --- | --- |
-| `MXBAI_API_KEY` | Mixedbread API key (required unless a `client` is injected). `MBREAD_API_KEY` and `MIXEDBREAD_API_KEY` are accepted aliases, tried in that order; pass `api_key_env=` to read some other variable instead. |
+| `MXBAI_API_KEY` | Mixedbread API key (required unless a `client` is injected). `MBREAD_API_KEY` and `MIXEDBREAD_API_KEY` are accepted aliases; pass `api_key_env=` to read some other variable. |
 | `MXBAI_BASE_URL` | Point the store client at a non-default Mixedbread deployment (aliases `MBREAD_BASE_URL`, `MIXEDBREAD_BASE_URL`). |
-| `AGENT_HARNESS_TOOL_CHOICE` | Override the wire `tool_choice` sent to the model. Per-rollout `HarnessTuning(tool_choice=...)` wins over the env var. |
-| `KEEP_REASONING_HISTORY` | Round-trip `reasoning_content` back into the message history. Off by default. Per-rollout `HarnessTuning(keep_reasoning_history=...)` wins over the env var. |
-| `AGENT_HARNESS_REQUIRE_EXACT_TOKENIZER` | On by default: a rollout whose policy tokenizer could not be installed fails instead of budgeting with the `chars/4` estimate. Set to `0` to allow the heuristic. |
-| `AGENT_HARNESS_TOKENIZER` | Load this checkpoint as the token counter instead of the model name the rollout carries (or the one passed to `ensure_token_counter`). Needed when the served name is an alias no tokenizer resolves for. |
-| `AGENT_HARNESS_TOKEN_COUNTER_BACKEND` | `gigatoken` (default; exact-parity-checked against HF, falls back to HF on any failure) or `hf` to opt out. gigatoken resolves `tokenizer.json` from a local checkpoint directory, else downloads it via `huggingface_hub`, else the HF tokenizer counts. |
-| `AGENT_HARNESS_CORPUS_BACKEND_TOP_K` | Candidates requested from the provider per `search_corpus` call, without changing any agent-visible limit. Read on first use, then frozen for the process; must be at least 5. Per-rollout `HarnessTuning(backend_top_k=...)` wins over the env var. |
+| `AGENT_HARNESS_TOOL_CHOICE` | Override the wire `tool_choice` sent to the model. Per-rollout `HarnessTuning(tool_choice=...)` wins. |
+| `KEEP_REASONING_HISTORY` | Round-trip `reasoning_content` back into the message history. Off by default. |
+| `AGENT_HARNESS_REQUIRE_EXACT_TOKENIZER` | On by default; set to `0` to allow the `chars/4` estimate when no tokenizer loads. |
+| `AGENT_HARNESS_TOKENIZER` | Load this checkpoint as the token counter instead of the model name the rollout carries. |
+| `AGENT_HARNESS_TOKEN_COUNTER_BACKEND` | `gigatoken` (default, parity-checked against HF) or `hf`. |
+| `AGENT_HARNESS_CORPUS_BACKEND_TOP_K` | Candidates requested from the provider per `search_corpus` call; at least 5. Per-rollout `HarnessTuning(backend_top_k=...)` wins. |
 | `AGENT_HARNESS_BRIDGE_TIMING` / `..._TIMING_FILE` | Write a per-phase timing trace. |
 
 ## Development

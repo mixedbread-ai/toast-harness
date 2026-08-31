@@ -9,6 +9,11 @@ one call's payload (single-digit milliseconds at the largest observed
 payloads), where a thread dispatch per tool call would cost comparable
 latency. The sync entry points in ``agent_harness.sync_api`` wrap these
 coroutines with adapted seams.
+
+``answer_mode`` (``schemas.AnswerMode``) picks how the episode ends: with a
+``submit_ranking`` call ("none"), with a ``submit_ranking`` call that carries
+a required answer ("submit_ranking"), or with a plain-text turn and no final
+tool at all ("plain_text").
 """
 
 from __future__ import annotations
@@ -16,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import Awaitable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
@@ -41,15 +46,18 @@ from agent_harness.config import (
 from agent_harness.errors import AGENT_ERROR_KIND, error_kind
 from agent_harness.llm import (
     AsyncGenerationFn,
+    ForcedSubmission,
     TokenUsage,
     completion_reasoning_tokens,
     extend_responses_api_trace,
+    force_answer,
     force_ranking,
     generation_failed,
     parse_ranking,
     require_generation_fn,
     response_message_to_dict,
     responses_api_trace_payload,
+    wire_forces_tool_call,
 )
 from agent_harness.metadata_guard import (
     build_metadata_registry,
@@ -57,12 +65,15 @@ from agent_harness.metadata_guard import (
     zero_result_filtered_search_count,
 )
 from agent_harness.prompts import (
+    force_answer_message,
     force_submit_message,
     over_budget_message,
     round_notice_message,
 )
 from agent_harness.retrieval import AsyncRetrievalClient
 from agent_harness.schemas import (
+    AnsweredRankedChunkList,
+    AnswerMode,
     FilterChunksArgs,
     GetChunksArgs,
     GrepArgs,
@@ -71,6 +82,7 @@ from agent_harness.schemas import (
     RankedChunkList,
     ReadDocumentArgs,
     SearchCorpusArgs,
+    validate_answer_mode,
 )
 from agent_harness.search import (
     ChunkIndex,
@@ -127,10 +139,24 @@ from .tool_trace import (
     synthetic_tool_call_trace,
 )
 
+AGENT_NAME = "fast_searcher"
+FINAL_TOOL_NAME = "submit_ranking"
+# The trace name of a forced plain-text answer, which no tool call carries.
+FINAL_ANSWER_TRACE_NAME = "final_answer"
+
 
 @dataclass(slots=True)
 class FastAgenticSearchResult:
-    """Structured fast-searcher result before rollout-record wrapping."""
+    """Structured fast-searcher result before rollout-record wrapping.
+
+    ``answer`` carries the final answer under a non-default ``answer_mode``:
+    the submitted ``answer`` argument ("submit_ranking") or the final
+    plain-text turn ("plain_text"); ``None`` under ``"none"``. In plain-text
+    mode ``ranking`` is always ``None`` and ``chunks`` always ``[]`` -- there
+    is no ranking to finalize -- and ``forced_ranking`` marks a forced
+    *answer*, keeping the field's one meaning: the final submission did not
+    come voluntarily.
+    """
 
     messages: list[dict[str, Any]]
     ranking: RankedChunkList | None
@@ -157,6 +183,8 @@ class FastAgenticSearchResult:
     deleted_chunk_ids: list[dict[str, Any]]
     deleted_chunk_refs: list[dict[str, Any]]
     prompt_snapshot: dict[str, Any] | None = None
+    answer: str | None = None
+    answer_mode: AnswerMode = "none"
 
     @property
     def total_tokens(self) -> int:
@@ -171,6 +199,7 @@ class FastAgenticSearchResult:
                 if isinstance(chunk, Mapping) and chunk.get("chunk_id")
             ],
             "chunks": self.chunks,
+            "answer": self.answer,
             "ranking_strategy": self.ranking.ranking_strategy if self.ranking else None,
             "top_k": self.top_k,
             "strict_top_k": self.strict_top_k,
@@ -181,6 +210,8 @@ class FastAgenticSearchResult:
         result = {
             "ranking": self.ranking,
             "ranking_strategy": self.ranking.ranking_strategy if self.ranking else None,
+            "answer": self.answer,
+            "answer_mode": self.answer_mode,
             "chunks": self.chunks,
             "top_k": self.top_k,
             "strict_top_k": self.strict_top_k,
@@ -235,10 +266,12 @@ class RolloutTotals:
         self.max_input_tokens = max(self.max_input_tokens, turn.input_tokens)
         return turn
 
-    def record_forced(self, usage: TokenUsage, *, prompt_tokens: int) -> None:
-        self.usage = self.usage + usage
-        self.max_input_tokens = max(self.max_input_tokens, prompt_tokens)
-        self.final_submit_input_tokens = prompt_tokens
+    def record_forced(self, forced: ForcedSubmission[Any], *, prompt_tokens: int) -> None:
+        """Add every forced attempt, preferring provider counts over the estimate."""
+        self.usage = self.usage + forced.usage
+        self.reasoning_tokens += forced.reasoning_tokens
+        self.max_input_tokens = max(self.max_input_tokens, forced.max_input_tokens or prompt_tokens)
+        self.final_submit_input_tokens = forced.final_input_tokens or prompt_tokens
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +293,134 @@ class SearcherToolRound:
     queries: list[dict[str, Any]]
     trace: list[dict[str, Any]]
     pruned_context: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _RoundConfig:
+    """What every tool round of one rollout reads and never changes.
+
+    The corpus bindings, the result index the rollout accumulates into, the
+    facets the metadata guard vets filters against, the ranking shape the
+    final call must satisfy, and the answer protocol the episode ends on.
+    """
+
+    index: ChunkIndex
+    store_identifiers: Sequence[str]
+    client: AsyncRetrievalClient | None
+    api_key: str | None
+    api_key_env: str | None
+    initial_metadata_facets: Mapping[str, Any] | None
+    top_k: int | None
+    strict_top_k: bool
+    answer_mode: AnswerMode = "none"
+
+    @property
+    def answers_in_text(self) -> bool:
+        return self.answer_mode == "plain_text"
+
+    @property
+    def requires_answer(self) -> bool:
+        return self.answer_mode == "submit_ranking"
+
+    @property
+    def final_tool_name(self) -> str | None:
+        """The tool that ends the episode, or ``None`` when a prose turn does."""
+        return None if self.answers_in_text else FINAL_TOOL_NAME
+
+    @property
+    def client_bindings(self) -> dict[str, Any]:
+        return {"client": self.client, "api_key": self.api_key, "api_key_env": self.api_key_env}
+
+    @property
+    def corpus_bindings(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "store_identifiers": self.store_identifiers,
+            **self.client_bindings,
+        }
+
+    @property
+    def filtered_search_executors(self) -> dict[str, _Executor]:
+        """The tools whose metadata filters are vetted before they run.
+
+        Bound on access rather than at import so a test that patches an
+        executor on this module is honored.
+        """
+        corpus = self.corpus_bindings
+        return {
+            "search_corpus": lambda args: execute_search_corpus(args, **corpus),
+            "filter_chunks": lambda args: execute_filter_chunks(args, **corpus),
+            "grep": lambda args: execute_grep(args, **corpus),
+        }
+
+    @property
+    def plain_retrieval_executors(self) -> dict[str, _Executor]:
+        """The tools that run as parsed: one corpus preview and two index lookups."""
+        corpus = self.corpus_bindings
+        lookup = {"index": self.index, **self.client_bindings}
+        return {
+            "overview_search": lambda args: execute_overview_search(args, **corpus),
+            "read_document": lambda args: execute_read_document(args, **lookup),
+            "get_chunks": lambda args: execute_get_chunks(args, **lookup),
+        }
+
+
+_Executor = Callable[[Mapping[str, Any]], Awaitable[Any]]
+
+
+@dataclass(slots=True)
+class _SearcherRun:
+    """What one searcher run accumulates: rounds, cost, trace, and the final submission.
+
+    ``final`` is the submitted ``RankedChunkList``, or the plain-text answer
+    under answer_mode="plain_text", or ``None`` until the forced tail compels
+    one. The round loop fills it; the forced tail extends it in place.
+    """
+
+    max_rounds: int
+    final: RankedChunkList | str | None = None
+    rounds_executed: int = 0
+    totals: RolloutTotals = field(default_factory=RolloutTotals)
+    queries: list[dict[str, Any]] = field(default_factory=list)
+    tool_call_iterations: list[dict[str, Any]] = field(default_factory=list)
+    tool_trace: list[dict[str, Any]] = field(default_factory=list)
+    openai_responses: list[dict[str, Any]] = field(default_factory=list)
+
+    def summarize_iteration(
+        self, tool_calls: Sequence[Any], *, over_budget_without_prune: bool = False
+    ) -> None:
+        self.tool_call_iterations.append(
+            summarize_tool_call_iteration(
+                agent=AGENT_NAME,
+                iteration=self.rounds_executed,
+                tool_calls=tool_calls,
+                over_budget_without_prune=over_budget_without_prune,
+            )
+        )
+
+    def merge(self, tool_round: SearcherToolRound) -> None:
+        self.queries.extend(tool_round.queries)
+        self.tool_trace.extend(tool_round.trace)
+        if isinstance(tool_round.final, RankedChunkList):
+            self.final = tool_round.final
+
+
+@dataclass(frozen=True, slots=True)
+class _AssistantTurn:
+    """One model turn the loop accepted: its message, its cost, and when it arrived."""
+
+    message: Any
+    usage: TokenUsage
+    returned_at: float
+
+    @property
+    def tool_calls(self) -> list[Any]:
+        return list(self.message.tool_calls or [])
+
+    @property
+    def text(self) -> str:
+        content = self.message.content
+        return content.strip() if isinstance(content, str) else ""
 
 
 async def _estimate_messages_tokens_off_loop(messages: Sequence[Mapping[str, Any]]) -> int:
@@ -287,6 +448,7 @@ async def fast_agentic_search(
     generation_fn: AsyncGenerationFn | None = None,
     tuning: HarnessTuning | None = None,
     as_of: date | None = None,
+    answer_mode: AnswerMode = "none",
 ) -> dict[str, Any]:
     """Run the fast searcher and return the plain-dict record payload."""
     result = await run_fast_agentic_search(
@@ -303,6 +465,7 @@ async def fast_agentic_search(
         generation_fn=generation_fn,
         tuning=tuning,
         as_of=as_of,
+        answer_mode=answer_mode,
     )
     return result.to_record()
 
@@ -322,54 +485,67 @@ async def run_fast_agentic_search(
     generation_fn: AsyncGenerationFn | None = None,
     tuning: HarnessTuning | None = None,
     as_of: date | None = None,
+    answer_mode: AnswerMode = "none",
 ) -> FastAgenticSearchResult:
     """Run the fast searcher and return structured loop state.
 
     ``as_of`` pins the runtime-context date instead of the UTC wall clock
-    (see ``prompts._runtime_context``).
-    """
-    if tuning is not None:
-        with harness_config.tuning_setting(tuning):
-            return await run_fast_agentic_search(
-                user_text,
-                store_identifiers=store_identifiers,
-                top_k=top_k,
-                strict_top_k=strict_top_k,
-                client=client,
-                api_key=api_key,
-                api_key_env=api_key_env,
-                additional_instructions=additional_instructions,
-                include_prompt_snapshot=include_prompt_snapshot,
-                media_content=media_content,
-                generation_fn=generation_fn,
-                as_of=as_of,
-            )
-    if media_content is not None:
-        with harness_config.media_content_setting(media_content):
-            return await run_fast_agentic_search(
-                user_text,
-                store_identifiers=store_identifiers,
-                top_k=top_k,
-                strict_top_k=strict_top_k,
-                client=client,
-                api_key=api_key,
-                api_key_env=api_key_env,
-                additional_instructions=additional_instructions,
-                include_prompt_snapshot=include_prompt_snapshot,
-                generation_fn=generation_fn,
-                as_of=as_of,
-            )
+    (see ``prompts._runtime_context``). ``tuning`` and ``media_content`` are
+    scoped to this rollout; both scopes are no-ops when left unset.
 
+    ``answer_mode`` picks the answer protocol (``schemas.AnswerMode``):
+    ``"none"`` is the default submit_ranking episode, byte-identical prompts
+    and tools; ``"submit_ranking"`` adds a required ``answer`` argument to the
+    final call; ``"plain_text"`` removes submit_ranking entirely -- the episode
+    ends on a plain-text turn with no tool calls, whose text is the answer, so
+    ``top_k`` and ``strict_top_k`` have no ranking to shape and are rejected.
+    """
+    validate_answer_mode(answer_mode)
+    if answer_mode == "plain_text" and (top_k is not None or strict_top_k):
+        raise ValueError("answer_mode='plain_text' has no ranking; top_k/strict_top_k do not apply")
+    with (
+        harness_config.tuning_setting(tuning),
+        harness_config.media_content_setting(media_content),
+    ):
+        return await _run_scoped_fast_agentic_search(
+            user_text,
+            store_identifiers=store_identifiers,
+            top_k=top_k,
+            strict_top_k=strict_top_k,
+            client=client,
+            api_key=api_key,
+            api_key_env=api_key_env,
+            additional_instructions=additional_instructions,
+            include_prompt_snapshot=include_prompt_snapshot,
+            generation_fn=generation_fn,
+            as_of=as_of,
+            answer_mode=answer_mode,
+        )
+
+
+async def _run_scoped_fast_agentic_search(
+    user_text: str,
+    *,
+    store_identifiers: Sequence[str],
+    top_k: int | None,
+    strict_top_k: bool,
+    client: AsyncRetrievalClient | None,
+    api_key: str | None,
+    api_key_env: str | None,
+    additional_instructions: str | None,
+    include_prompt_snapshot: bool,
+    generation_fn: AsyncGenerationFn | None,
+    as_of: date | None,
+    answer_mode: AnswerMode,
+) -> FastAgenticSearchResult:
+    """The rollout proper: bootstrap, the round loop, the forced tail, the result."""
     generate = require_generation_fn(generation_fn)
     # Every budget below measures through config.count_text_tokens: install the
     # policy tokenizer behind it before the first prompt is built. The first
     # install loads the tokenizer (possibly a hub download), so it runs off the
     # event loop; later calls are an O(1) resolved-model check.
     await asyncio.to_thread(ensure_rollout_token_counter, searcher_agent_config().get("model"))
-    effective_top_k = normalize_top_k(top_k)
-    if strict_top_k and effective_top_k is None:
-        effective_top_k = AGENTIC_SEARCH_DEFAULT_K
-    effective_strict_top_k = bool(strict_top_k and effective_top_k is not None)
+    effective_top_k, effective_strict_top_k = _resolve_ranking_shape(top_k, strict_top_k)
 
     index = ChunkIndex()
     bootstrap = await _fetch_initial_context(
@@ -380,18 +556,17 @@ async def run_fast_agentic_search(
         api_key=api_key,
         api_key_env=api_key_env,
     )
-    initial_metadata_facets = bootstrap.metadata_facets
-    initial_search_results = bootstrap.search_results
     messages = fast_searcher_messages(
         user_text=user_text,
-        initial_search_results=initial_search_results,
-        initial_metadata_facets=initial_metadata_facets,
+        initial_search_results=bootstrap.search_results,
+        initial_metadata_facets=bootstrap.metadata_facets,
         top_k=effective_top_k,
         strict_top_k=effective_strict_top_k,
         additional_instructions=additional_instructions,
         as_of=as_of,
+        answer_mode=answer_mode,
     )
-    messages.extend(media_messages_for_payload(initial_search_results))
+    messages.extend(media_messages_for_payload(bootstrap.search_results))
     prompt_snapshot = (
         _fast_searcher_prompt_snapshot(
             messages=messages,
@@ -400,238 +575,431 @@ async def run_fast_agentic_search(
         if include_prompt_snapshot
         else None
     )
-    queries_made: list[dict[str, Any]] = [
-        {**bootstrap.metadata_query, "source": "initial_metadata_facets"},
-        {**bootstrap.search_query, "source": "initial_original_query"},
-    ]
-    final_ranking: RankedChunkList | None = None
-    totals = RolloutTotals()
-    rounds_executed = 0
-    prompt_tokens_estimate = 0
-    tool_call_iterations: list[dict[str, Any]] = []
-    tool_trace: list[dict[str, Any]] = list(bootstrap.trace_events)
-    openai_responses: list[dict[str, Any]] = []
 
-    search_rounds = 0
-    max_rounds = searcher_max_rounds()
-    while search_rounds < max_rounds:
-        rounds_executed += 1
+    config = _RoundConfig(
+        index=index,
+        store_identifiers=store_identifiers,
+        client=client,
+        api_key=api_key,
+        api_key_env=api_key_env,
+        initial_metadata_facets=bootstrap.metadata_facets,
+        top_k=effective_top_k,
+        strict_top_k=effective_strict_top_k,
+        answer_mode=answer_mode,
+    )
+    run = await _run_searcher_rounds(generate=generate, messages=messages, config=config)
+    forced_ranking = run.final is None
+    if forced_ranking:
+        force = _force_final_answer if config.answers_in_text else _force_final_ranking
+        run.final = await force(messages, run, generate=generate, config=config)
+
+    return _build_search_result(
+        messages=messages,
+        bootstrap=bootstrap,
+        run=run,
+        config=config,
+        forced_ranking=forced_ranking,
+        additional_instructions=additional_instructions,
+        prompt_snapshot=prompt_snapshot,
+    )
+
+
+def _resolve_ranking_shape(top_k: int | None, strict_top_k: bool) -> tuple[int | None, bool]:
+    """Normalize the requested ranking shape.
+
+    A strict top-k with no k falls back to the default k; strictness without a
+    k to enforce is meaningless and is dropped.
+    """
+    effective_top_k = normalize_top_k(top_k)
+    if strict_top_k and effective_top_k is None:
+        effective_top_k = AGENTIC_SEARCH_DEFAULT_K
+    return effective_top_k, bool(strict_top_k and effective_top_k is not None)
+
+
+def _build_search_result(
+    *,
+    messages: list[dict[str, Any]],
+    bootstrap: InitialSearchContext,
+    run: _SearcherRun,
+    config: _RoundConfig,
+    forced_ranking: bool,
+    additional_instructions: str | None,
+    prompt_snapshot: dict[str, Any] | None,
+) -> FastAgenticSearchResult:
+    """Finalize the ranking and assemble the structured result."""
+    clock = _PhaseClock()
+    final_ranking, final_answer = _split_final_submission(run.final)
+    chunks = finalize_chunks(
+        config.index, final_ranking, top_k=config.top_k, strict_top_k=config.strict_top_k
+    )
+    clock.mark("chunks_finalized")
+    deleted_chunk_keys = sorted(config.index.deleted_chunk_keys)
+    result = FastAgenticSearchResult(
+        messages=messages,
+        ranking=final_ranking,
+        chunks=chunks,
+        top_k=config.top_k,
+        strict_top_k=config.strict_top_k,
+        media_content=harness_config.MEDIA_CONTENT,
+        additional_instructions=additional_instructions,
+        queries_made=[
+            {**bootstrap.metadata_query, "source": "initial_metadata_facets"},
+            {**bootstrap.search_query, "source": "initial_original_query"},
+            *run.queries,
+        ],
+        initial_search_results=bootstrap.search_results,
+        initial_metadata_facets=bootstrap.metadata_facets,
+        input_tokens=run.totals.usage.input_tokens,
+        output_tokens=run.totals.usage.output_tokens,
+        reasoning_tokens=run.totals.reasoning_tokens,
+        max_input_tokens=run.totals.max_input_tokens,
+        final_submit_input_tokens=run.totals.final_submit_input_tokens,
+        rounds_executed=run.rounds_executed,
+        forced_ranking=forced_ranking,
+        ranking_unresolved=ranking_unresolved(config.index, final_ranking),
+        tool_call_iterations=run.tool_call_iterations,
+        tool_trace=[*bootstrap.trace_events, *run.tool_trace],
+        openai_responses=run.openai_responses,
+        id_mapping=config.index.refs.snapshot(),
+        deleted_chunk_ids=[
+            {"store_id": key[0], "file_id": key[1], "chunk_index": key[2]}
+            for key in deleted_chunk_keys
+        ],
+        deleted_chunk_refs=[
+            {"chunk_id": config.index.refs.chunk_id_for_key(key)} for key in deleted_chunk_keys
+        ],
+        prompt_snapshot=prompt_snapshot,
+        answer=final_answer,
+        answer_mode=config.answer_mode,
+    )
+    clock.mark("assembled")
+    emit_bridge_timing(
+        "search_result_construction",
+        forced=forced_ranking,
+        chunk_count=len(chunks),
+        finalize_chunks_ms=clock.ms("start", "chunks_finalized"),
+        snapshot_and_dataclass_ms=clock.ms("chunks_finalized", "assembled"),
+        total_ms=clock.ms("start", "assembled"),
+    )
+    return result
+
+
+def _split_final_submission(
+    final: RankedChunkList | str | None,
+) -> tuple[RankedChunkList | None, str | None]:
+    """The ranking and the answer one final submission carries, either possibly absent."""
+    if isinstance(final, str):
+        return None, final
+    answer = final.answer if isinstance(final, AnsweredRankedChunkList) else None
+    return final, answer
+
+
+async def _run_searcher_rounds(
+    *,
+    generate: AsyncGenerationFn,
+    messages: list[dict[str, Any]],
+    config: _RoundConfig,
+) -> _SearcherRun:
+    """Drive generate/tool-call rounds until a final submission or the round cap.
+
+    A turn with no tool calls ends the loop. Under answer_mode="plain_text" it
+    ends it *successfully* -- that prose is the episode's answer, and no final
+    tool exists for it to have called instead. Everywhere else, and when the
+    turn came back empty, the caller's forced tail compels the submission.
+    """
+    run = _SearcherRun(max_rounds=searcher_max_rounds())
+    prompt_tokens_estimate = 0
+    while run.rounds_executed < run.max_rounds:
+        run.rounds_executed += 1
         estimated_tokens = max(
             prompt_tokens_estimate, await _estimate_messages_tokens_off_loop(messages)
         )
-        # The tools schema stays identical across every round -- over-budget
-        # rounds included; a missing prune is recorded after generation instead
-        # of swapping in a reduced tool list, so every round of one rollout
-        # presents the same tool surface.
-        tools = _searcher_tools(
-            top_k=effective_top_k,
-            strict_top_k=effective_strict_top_k,
-        )
-        if rounds_executed > 1:
-            messages.append(round_notice_message(rounds_executed, max_rounds))
-        over_budget = estimated_tokens >= SEARCHER_PRUNE_REMINDER_TOKENS
-        if over_budget:
-            messages.append(over_budget_message(estimated_tokens))
-        search_rounds += 1
-
-        response = await generate(
+        over_budget = _append_round_preamble(
             messages,
-            tools=tools,
-            completion_config=searcher_agent_config(),
+            round_index=run.rounds_executed,
+            max_rounds=run.max_rounds,
+            estimated_tokens=estimated_tokens,
+            final_tool_name=config.final_tool_name,
         )
-        response_returned = time.perf_counter()
-        extend_responses_api_trace(
-            openai_responses,
-            response,
-            agent="fast_searcher",
-            iteration=rounds_executed,
-            phase="generation",
-        )
-        if generation_failed(response):
+        turn = await _generate_turn(generate, messages, config=config, run=run)
+        if turn is None:
             break
-        turn_usage = totals.record_turn(response)
-        prompt_tokens_estimate = turn_usage.input_tokens
+        prompt_tokens_estimate = turn.usage.input_tokens
 
-        assistant_message = response.choices[0].message if response.choices else None
-        if assistant_message is None:
+        tool_calls = turn.tool_calls
+        if not tool_calls:
+            run.summarize_iteration([])
+            if config.answers_in_text and turn.text:
+                run.final = turn.text
+                run.totals.final_submit_input_tokens = turn.usage.input_tokens
             break
-        messages.append(response_message_to_dict(assistant_message))
-        if not assistant_message.tool_calls:
-            tool_call_iterations.append(
-                summarize_tool_call_iteration(
-                    agent="fast_searcher",
-                    iteration=rounds_executed,
-                    tool_calls=[],
-                )
-            )
-            break
-        if any(
-            getattr(getattr(tool_call, "function", None), "name", "") == "submit_ranking"
-            for tool_call in assistant_message.tool_calls
-        ):
-            totals.final_submit_input_tokens = turn_usage.input_tokens
-
-        tool_call_iterations.append(
-            summarize_tool_call_iteration(
-                agent="fast_searcher",
-                iteration=rounds_executed,
-                tool_calls=assistant_message.tool_calls,
-                over_budget_without_prune=over_budget_round_missing_prune(
-                    over_budget,
-                    assistant_message.tool_calls,
-                    final_tool_name="submit_ranking",
-                ),
-            )
+        if config.final_tool_name is not None and _names_final_tool(tool_calls):
+            run.totals.final_submit_input_tokens = turn.usage.input_tokens
+        run.summarize_iteration(
+            tool_calls,
+            over_budget_without_prune=over_budget_round_missing_prune(
+                over_budget, tool_calls, final_tool_name=config.final_tool_name
+            ),
         )
         response_adapted = time.perf_counter()
 
         tool_round = await _handle_searcher_tool_calls(
-            assistant_message.tool_calls,
-            agent_iteration=rounds_executed,
+            tool_calls,
+            config,
+            iteration=run.rounds_executed,
             messages=messages,
-            index=index,
-            store_identifiers=store_identifiers,
-            client=client,
-            api_key=api_key,
-            api_key_env=api_key_env,
-            initial_metadata_facets=initial_metadata_facets,
-            top_k=effective_top_k,
-            strict_top_k=effective_strict_top_k,
-            context_tokens_baseline=turn_usage.total_tokens,
+            context_tokens_baseline=turn.usage.total_tokens,
         )
         tool_handler_finished = time.perf_counter()
-        queries_made.extend(tool_round.queries)
-        tool_trace.extend(tool_round.trace)
-        if isinstance(tool_round.final, RankedChunkList):
-            final_ranking = tool_round.final
+        run.merge(tool_round)
         if tool_round.pruned_context:
             prompt_tokens_estimate = await _estimate_messages_tokens_off_loop(messages)
-        if final_ranking is not None:
+        if run.final is not None:
             emit_bridge_timing(
                 "final_response_processing",
                 forced=False,
-                response_trace_and_adaptation_ms=round(
-                    (response_adapted - response_returned) * 1000, 3
-                ),
-                ranking_handler_ms=round((tool_handler_finished - response_adapted) * 1000, 3),
-                total_ms=round((tool_handler_finished - response_returned) * 1000, 3),
+                response_trace_and_adaptation_ms=_elapsed_ms(turn.returned_at, response_adapted),
+                ranking_handler_ms=_elapsed_ms(response_adapted, tool_handler_finished),
+                total_ms=_elapsed_ms(turn.returned_at, tool_handler_finished),
             )
             break
+    return run
 
-    forced_ranking = final_ranking is None
-    if forced_ranking:
+
+def _append_round_preamble(
+    messages: list[dict[str, Any]],
+    *,
+    round_index: int,
+    max_rounds: int,
+    estimated_tokens: int,
+    final_tool_name: str | None,
+) -> bool:
+    """Label the round and, past the prune trigger, ask for a prune.
+
+    Returns whether the round is over budget, which the iteration summary
+    records against the calls the model then makes.
+    """
+    if round_index > 1:
         messages.append(
-            force_submit_message(
-                top_k=effective_top_k,
-                strict_top_k=effective_strict_top_k,
-                round_index=rounds_executed,
-                max_rounds=max_rounds,
+            round_notice_message(round_index, max_rounds, final_tool_name=final_tool_name)
+        )
+    over_budget = estimated_tokens >= SEARCHER_PRUNE_REMINDER_TOKENS
+    if over_budget:
+        messages.append(over_budget_message(estimated_tokens, final_tool_name=final_tool_name))
+    return over_budget
+
+
+async def _generate_turn(
+    generate: AsyncGenerationFn,
+    messages: list[dict[str, Any]],
+    *,
+    config: _RoundConfig,
+    run: _SearcherRun,
+) -> _AssistantTurn | None:
+    """One model turn: generate, trace, account for it, and append it to the transcript.
+
+    ``None`` when the seam reported a failed generation or an empty response;
+    the loop ends there and the forced tail takes over. The tools schema stays
+    identical across every round -- over-budget rounds included; a missing
+    prune is recorded after generation instead of swapping in a reduced tool
+    list, so every round of one rollout presents the same tool surface.
+    """
+    response = await generate(
+        messages,
+        tools=_round_tools(config),
+        completion_config=_rollout_completion_config(config.answer_mode),
+    )
+    returned_at = time.perf_counter()
+    extend_responses_api_trace(
+        run.openai_responses,
+        response,
+        agent=AGENT_NAME,
+        iteration=run.rounds_executed,
+        phase="generation",
+    )
+    if generation_failed(response):
+        return None
+    usage = run.totals.record_turn(response)
+    message = response.choices[0].message if response.choices else None
+    if message is None:
+        return None
+    messages.append(response_message_to_dict(message))
+    return _AssistantTurn(message=message, usage=usage, returned_at=returned_at)
+
+
+def _names_final_tool(tool_calls: Sequence[Any]) -> bool:
+    return any(
+        getattr(getattr(tool_call, "function", None), "name", "") == FINAL_TOOL_NAME
+        for tool_call in tool_calls
+    )
+
+
+def _rollout_completion_config(answer_mode: AnswerMode) -> dict[str, Any]:
+    """The searcher's completion config for this rollout's answer protocol.
+
+    Plain-text answer mode ends the episode on a turn with no tool calls, so
+    both the harness-side ``require_tool_calls`` policy and a wire-level forced
+    ``tool_choice`` are neutralized. Every other mode gets the config
+    untouched, which keeps answer_mode="none" identical on the wire. Always a
+    fresh copy: a generation seam that rewrites its config in place must not
+    reach the shared default.
+    """
+    config = dict(searcher_agent_config())
+    if answer_mode != "plain_text":
+        return config
+    config["require_tool_calls"] = False
+    if wire_forces_tool_call(config.get("tool_choice")):
+        config["tool_choice"] = "auto"
+    return config
+
+
+def _round_tools(config: _RoundConfig) -> list[dict[str, Any]]:
+    return _searcher_tools(
+        top_k=config.top_k, strict_top_k=config.strict_top_k, answer_mode=config.answer_mode
+    )
+
+
+@dataclass(slots=True)
+class _ForcedTail:
+    """Bookkeeping around one forced final turn: its iteration, prompt cost, and trace.
+
+    The forced turn counts as one past the last executed round; its cost and
+    trace land on ``run`` like any other turn's.
+    """
+
+    run: _SearcherRun
+    trace_name: str
+    prompt_tokens: int
+
+    @classmethod
+    async def start(
+        cls,
+        messages: Sequence[Mapping[str, Any]],
+        run: _SearcherRun,
+        *,
+        trace_name: str,
+    ) -> _ForcedTail:
+        """Measure the forced prompt after its instruction has been appended."""
+        return cls(run, trace_name, await _estimate_messages_tokens_off_loop(messages))
+
+    @property
+    def iteration(self) -> int:
+        return self.run.rounds_executed + 1
+
+    @property
+    def trace_metadata(self) -> dict[str, Any]:
+        return {"agent": AGENT_NAME, "iteration": self.iteration}
+
+    def record_invalid_attempt(self, attempt: int, validation_error: str) -> None:
+        self.run.tool_trace.append(
+            synthetic_tool_call_trace(
+                agent=AGENT_NAME,
+                iteration=self.iteration,
+                name=self.trace_name,
+                metadata={"forced": True, "attempt": attempt},
+                status="error",
+                error=validation_error,
+                error_kind=AGENT_ERROR_KIND,
+                attempt=attempt,
             )
         )
-        forced_submit_input_tokens = await _estimate_messages_tokens_off_loop(messages)
-        forced = await force_ranking(
-            messages,
-            tools=_searcher_tools(
-                top_k=effective_top_k,
-                strict_top_k=effective_strict_top_k,
-            ),
-            completion_config=searcher_agent_config(),
-            validate=lambda ranking: validate_ranked_chunk_ids(
-                ranking,
-                index,
-                top_k=effective_top_k,
-                strict_top_k=effective_strict_top_k,
-            ),
-            responses_trace=openai_responses,
-            response_trace_metadata={
-                "agent": "fast_searcher",
-                "iteration": rounds_executed + 1,
-            },
-            generation_fn=generate,
-            on_invalid_attempt=lambda attempt, validation_error: tool_trace.append(
-                synthetic_tool_call_trace(
-                    agent="fast_searcher",
-                    iteration=rounds_executed + 1,
-                    name="submit_ranking",
-                    metadata={"forced": True, "attempt": attempt},
-                    status="error",
-                    error=validation_error,
-                    error_kind=AGENT_ERROR_KIND,
-                    attempt=attempt,
-                )
-            ),
-        )
-        totals.record_forced(forced.usage, prompt_tokens=forced_submit_input_tokens)
-        final_ranking = forced.submission
-        tool_trace.append(
+
+    def finish(
+        self,
+        forced: ForcedSubmission[Any],
+        *,
+        arguments: Any,
+        output: Any,
+        failure: str,
+    ) -> None:
+        self.run.totals.record_forced(forced, prompt_tokens=self.prompt_tokens)
+        succeeded = forced.submission is not None
+        self.run.tool_trace.append(
             synthetic_tool_call_trace(
-                agent="fast_searcher",
-                iteration=rounds_executed + 1,
-                name="submit_ranking",
-                arguments=final_ranking,
-                output={"ranking": ranking_trace_payload(final_ranking, index)},
+                agent=AGENT_NAME,
+                iteration=self.iteration,
+                name=self.trace_name,
+                arguments=arguments,
+                output=output,
                 metadata={
                     "forced": True,
                     "input_tokens": forced.usage.input_tokens,
                     "output_tokens": forced.usage.output_tokens,
                 },
-                status="success" if final_ranking is not None else "error",
-                error=None if final_ranking is not None else "forced ranking failed",
+                status="success" if succeeded else "error",
+                error=None if succeeded else failure,
             )
         )
 
-    result_build_started = time.perf_counter()
-    chunks = finalize_chunks(
-        index,
-        final_ranking,
-        top_k=effective_top_k,
-        strict_top_k=effective_strict_top_k,
-    )
 
-    chunks_finished = time.perf_counter()
-    result = FastAgenticSearchResult(
-        messages=messages,
-        ranking=final_ranking,
-        chunks=chunks,
-        top_k=effective_top_k,
-        strict_top_k=effective_strict_top_k,
-        media_content=harness_config.MEDIA_CONTENT,
-        additional_instructions=additional_instructions,
-        queries_made=queries_made,
-        initial_search_results=initial_search_results,
-        initial_metadata_facets=initial_metadata_facets,
-        input_tokens=totals.usage.input_tokens,
-        output_tokens=totals.usage.output_tokens,
-        reasoning_tokens=totals.reasoning_tokens,
-        max_input_tokens=totals.max_input_tokens,
-        final_submit_input_tokens=totals.final_submit_input_tokens,
-        rounds_executed=rounds_executed,
-        forced_ranking=forced_ranking,
-        ranking_unresolved=ranking_unresolved(index, final_ranking),
-        tool_call_iterations=tool_call_iterations,
-        tool_trace=tool_trace,
-        openai_responses=openai_responses,
-        id_mapping=index.refs.snapshot(),
-        deleted_chunk_ids=[
-            {"store_id": key[0], "file_id": key[1], "chunk_index": key[2]}
-            for key in sorted(index.deleted_chunk_keys)
-        ],
-        deleted_chunk_refs=[
-            {"chunk_id": index.refs.chunk_id_for_key(key)}
-            for key in sorted(index.deleted_chunk_keys)
-        ],
-        prompt_snapshot=prompt_snapshot,
+async def _force_final_ranking(
+    messages: list[dict[str, Any]],
+    run: _SearcherRun,
+    *,
+    generate: AsyncGenerationFn,
+    config: _RoundConfig,
+) -> RankedChunkList | None:
+    """Compel the ranking the round loop never received."""
+    messages.append(
+        force_submit_message(
+            top_k=config.top_k,
+            strict_top_k=config.strict_top_k,
+            require_answer=config.requires_answer,
+            round_index=run.rounds_executed,
+            max_rounds=run.max_rounds,
+        )
     )
-    result_finished = time.perf_counter()
-    emit_bridge_timing(
-        "search_result_construction",
-        forced=forced_ranking,
-        chunk_count=len(chunks),
-        finalize_chunks_ms=round((chunks_finished - result_build_started) * 1000, 3),
-        snapshot_and_dataclass_ms=round((result_finished - chunks_finished) * 1000, 3),
-        total_ms=round((result_finished - result_build_started) * 1000, 3),
+    tail = await _ForcedTail.start(messages, run, trace_name=FINAL_TOOL_NAME)
+    forced = await force_ranking(
+        messages,
+        tools=_round_tools(config),
+        completion_config=_rollout_completion_config(config.answer_mode),
+        validate=lambda ranking: validate_ranked_chunk_ids(
+            ranking, config.index, top_k=config.top_k, strict_top_k=config.strict_top_k
+        ),
+        require_answer=config.requires_answer,
+        responses_trace=run.openai_responses,
+        response_trace_metadata=tail.trace_metadata,
+        generation_fn=generate,
+        on_invalid_attempt=tail.record_invalid_attempt,
     )
-    return result
+    tail.finish(
+        forced,
+        arguments=forced.submission,
+        output={"ranking": ranking_trace_payload(forced.submission, config.index)},
+        failure="forced ranking failed",
+    )
+    return forced.submission
+
+
+async def _force_final_answer(
+    messages: list[dict[str, Any]],
+    run: _SearcherRun,
+    *,
+    generate: AsyncGenerationFn,
+    config: _RoundConfig,
+) -> str | None:
+    """Compel the plain-text answer the round loop never received."""
+    messages.append(
+        force_answer_message(round_index=run.rounds_executed, max_rounds=run.max_rounds)
+    )
+    tail = await _ForcedTail.start(messages, run, trace_name=FINAL_ANSWER_TRACE_NAME)
+    forced = await force_answer(
+        messages,
+        tools=_round_tools(config),
+        completion_config=_rollout_completion_config(config.answer_mode),
+        responses_trace=run.openai_responses,
+        response_trace_metadata=tail.trace_metadata,
+        generation_fn=generate,
+        on_invalid_attempt=tail.record_invalid_attempt,
+    )
+    tail.finish(
+        forced,
+        arguments={"answer": forced.submission},
+        output={"answer": forced.submission},
+        failure="forced answer failed",
+    )
+    return forced.submission
 
 
 def _bootstrap_trace_event(
@@ -646,7 +1014,7 @@ def _bootstrap_trace_event(
     query = outcome.query if isinstance(outcome.query, Mapping) else {}
     error = payload.get("error") or query.get("error")
     return synthetic_tool_call_trace(
-        agent="fast_searcher",
+        agent=AGENT_NAME,
         iteration=0,
         name=name,
         arguments=outcome.query,
@@ -879,15 +1247,21 @@ def _searcher_tools(
     *,
     top_k: int | None = None,
     strict_top_k: bool = False,
+    answer_mode: AnswerMode = "none",
 ) -> list[dict[str, Any]]:
-    # Deliberately not passing chunk_ids/document_ids here: nothing enforces
-    # this enum (no strict/guided decoding on these tools), the IDs are
-    # already visible to the model in prior tool results, and unknown-ID
-    # tool calls already get a graceful tool_error from the handlers below.
-    # Populating it would also make the tool schema grow every round as more
-    # chunks are discovered, breaking the identical-tools-per-round rule above.
-    final_tool = submit_ranking_tool(top_k=top_k, strict_top_k=strict_top_k)
-    return [
+    """The tool surface one rollout offers on every round.
+
+    Deliberately not passing chunk_ids/document_ids here: nothing enforces
+    this enum (no strict/guided decoding on these tools), the IDs are already
+    visible to the model in prior tool results, and unknown-ID tool calls
+    already get a graceful tool_error from the handlers below. Populating it
+    would also make the tool schema grow every round as more chunks are
+    discovered, breaking the identical-tools-per-round rule above.
+
+    Under answer_mode="plain_text" the episode ends on a plain-text turn, so
+    there is no final tool to advertise.
+    """
+    tools = [
         overview_search_tool(),
         search_corpus_tool(),
         filter_chunks_tool(),
@@ -895,8 +1269,16 @@ def _searcher_tools(
         read_document_tool(),
         get_chunks_tool(),
         prune_context_tool(),
-        final_tool,
     ]
+    if answer_mode != "plain_text":
+        tools.append(
+            submit_ranking_tool(
+                top_k=top_k,
+                strict_top_k=strict_top_k,
+                require_answer=answer_mode == "submit_ranking",
+            )
+        )
+    return tools
 
 
 def estimate_messages_tokens(messages: Sequence[Mapping[str, Any]]) -> int:
@@ -915,383 +1297,73 @@ class _PendingToolCall:
     metadata_validation: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(slots=True)
+class _RoundState:
+    """What one round's phases accumulate."""
+
+    iteration: int
+    tool_messages: dict[str, dict[str, Any]] = field(default_factory=dict)
+    queries_made: list[dict[str, Any]] = field(default_factory=list)
+    tool_trace: list[dict[str, Any]] = field(default_factory=list)
+    pending: list[_PendingToolCall] = field(default_factory=list)
+    final_result: Any | None = None
+    prune_chunk_keys: set[tuple[str, str, int]] = field(default_factory=set)
+    prune_document_keys: set[tuple[str, str]] = field(default_factory=set)
+
+    @property
+    def pruned_context(self) -> bool:
+        return bool(self.prune_chunk_keys or self.prune_document_keys)
+
+
+def _fail_tool_call(
+    state: _RoundState,
+    tool_call: Any,
+    trace_event: dict[str, Any],
+    error: str,
+    *,
+    error_kind: str | None = None,
+) -> None:
+    """Answer one failed call: an error message for the model, an error event
+    for the trace."""
+    state.tool_messages[tool_call.id] = tool_error(tool_call.id, error)
+    finish_tool_call_trace(trace_event, status="error", error=error, error_kind=error_kind)
+
+
 async def _handle_searcher_tool_calls(
     tool_calls: Sequence[Any],
+    config: _RoundConfig,
     *,
-    agent_iteration: int,
+    iteration: int,
     messages: list[dict[str, Any]],
-    index: ChunkIndex,
-    store_identifiers: Sequence[str],
-    client: AsyncRetrievalClient | None = None,
-    api_key: str | None = None,
-    api_key_env: str | None = None,
-    initial_metadata_facets: Mapping[str, Any] | None = None,
-    top_k: int | None = None,
-    strict_top_k: bool = False,
     context_tokens_baseline: int | None = None,
 ) -> SearcherToolRound:
-    timing_started = time.perf_counter()
-    tool_messages: dict[str, dict[str, Any]] = {}
-    queries_made: list[dict[str, Any]] = []
-    tool_trace: list[dict[str, Any]] = []
-    final_result: Any | None = None
-    pending: list[_PendingToolCall] = []
-    prune_chunk_keys: set[tuple[str, str, int]] = set()
-    prune_document_keys: set[tuple[str, str]] = set()
+    """Run one round of model tool calls end to end.
 
-    tool_call_count = 0
-    group_size = len(tool_calls)
-    # The dispatch loop creates the tool coroutines eagerly; if it raises
-    # before the gather, close them so nothing is silently dropped un-awaited.
-    try:
-        for call_index, tool_call in enumerate(tool_calls, 1):
-            trace_event = start_tool_call_trace(
-                agent="fast_searcher",
-                iteration=agent_iteration,
-                tool_call=tool_call,
-                call_index=call_index,
-                group_size=group_size,
-            )
-            tool_trace.append(trace_event)
-            tool_name = tool_call.function.name
-            raw_arguments = tool_call.function.arguments
+    Dispatch decodes every call and starts the remote ones, the gather awaits
+    them, and the tail prepares the messages the model reads next round:
+    truncation, append, redaction. Each phase's timing lands on the
+    ``tool_results_prepared`` bridge event.
+    """
+    clock = _PhaseClock()
+    state = _RoundState(iteration=iteration)
+    _dispatch_tool_calls(tool_calls, config, state)
+    clock.mark("dispatched")
 
-            if tool_call_count >= MAX_PARALLEL_TOOL_CALLS:
-                error_message = (
-                    f"Too many parallel tool calls requested. Maximum is {MAX_PARALLEL_TOOL_CALLS}."
-                )
-                tool_messages[tool_call.id] = tool_error(tool_call.id, error_message)
-                finish_tool_call_trace(
-                    trace_event,
-                    status="error",
-                    error=error_message,
-                )
-                continue
-            tool_call_count += 1
-
-            if tool_name == "submit_ranking":
-                try:
-                    parsed_ranking = parse_ranking(raw_arguments)
-                    validate_ranked_chunk_ids(
-                        parsed_ranking,
-                        index,
-                        top_k=top_k,
-                        strict_top_k=strict_top_k,
-                    )
-                    final_result = parsed_ranking
-                    finish_tool_call_trace(
-                        trace_event,
-                        output={"ranking": ranking_trace_payload(parsed_ranking, index)},
-                    )
-                except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                    tool_messages[tool_call.id] = tool_error(
-                        tool_call.id,
-                        f"Failed to parse ranking: {exc}",
-                    )
-                    finish_tool_call_trace(
-                        trace_event,
-                        status="error",
-                        error=f"Failed to parse ranking: {exc}",
-                    )
-                continue
-
-            parsed = parse_tool_args(tool_call, _SEARCHER_ARG_SCHEMAS.get(tool_name))
-            if isinstance(parsed, dict) and "error" in parsed:
-                tool_messages[tool_call.id] = tool_error(tool_call.id, parsed["error"])
-                finish_tool_call_trace(
-                    trace_event,
-                    status="error",
-                    error=parsed["error"],
-                )
-                continue
-            trace_event["parsed_arguments"] = jsonable(parsed)
-
-            if tool_name == "search_corpus":
-                validation = validate_metadata_filter_args(
-                    parsed.model_dump(mode="json"),
-                    registry=build_metadata_registry(
-                        initial_metadata_facets=initial_metadata_facets,
-                        index=index,
-                    ),
-                )
-                if not validation.valid:
-                    validation_metadata = validation.trace_metadata()
-                    payload = {
-                        "tool": "search_corpus",
-                        "error": "Invalid metadata filters; use only verified metadata fields and values.",
-                        "metadata_validation": validation_metadata,
-                    }
-                    tool_messages[tool_call.id] = tool_message(tool_call.id, payload)
-                    finish_tool_call_trace(
-                        trace_event,
-                        status="error",
-                        output=payload,
-                        metadata=validation_metadata,
-                        error="Invalid metadata filters",
-                    )
-                    continue
-                trace_event["parsed_arguments"] = jsonable(validation.args)
-                pending.append(
-                    _PendingToolCall(
-                        tool_call=tool_call,
-                        kind="search_corpus",
-                        trace_event=trace_event,
-                        execute=execute_search_corpus(
-                            validation.args,
-                            index=index,
-                            store_identifiers=store_identifiers,
-                            client=client,
-                            api_key=api_key,
-                            api_key_env=api_key_env,
-                        ),
-                        metadata_validation=validation.trace_metadata(),
-                    )
-                )
-                continue
-
-            if tool_name == "filter_chunks":
-                validation = validate_metadata_filter_args(
-                    parsed.model_dump(mode="json"),
-                    registry=build_metadata_registry(
-                        initial_metadata_facets=initial_metadata_facets,
-                        index=index,
-                    ),
-                )
-                if not validation.valid:
-                    validation_metadata = validation.trace_metadata()
-                    payload = {
-                        "tool": "filter_chunks",
-                        "error": "Invalid metadata filters; use only verified metadata fields and values.",
-                        "metadata_validation": validation_metadata,
-                    }
-                    tool_messages[tool_call.id] = tool_message(tool_call.id, payload)
-                    finish_tool_call_trace(
-                        trace_event,
-                        status="error",
-                        output=payload,
-                        metadata=validation_metadata,
-                        error="Invalid metadata filters",
-                    )
-                    continue
-                trace_event["parsed_arguments"] = jsonable(validation.args)
-                pending.append(
-                    _PendingToolCall(
-                        tool_call=tool_call,
-                        kind="filter_chunks",
-                        trace_event=trace_event,
-                        execute=execute_filter_chunks(
-                            validation.args,
-                            index=index,
-                            store_identifiers=store_identifiers,
-                            client=client,
-                            api_key=api_key,
-                            api_key_env=api_key_env,
-                        ),
-                        metadata_validation=validation.trace_metadata(),
-                    )
-                )
-                continue
-
-            if tool_name == "grep":
-                validation = validate_metadata_filter_args(
-                    parsed.model_dump(mode="json"),
-                    registry=build_metadata_registry(
-                        initial_metadata_facets=initial_metadata_facets,
-                        index=index,
-                    ),
-                )
-                if not validation.valid:
-                    validation_metadata = validation.trace_metadata()
-                    payload = {
-                        "tool": "grep",
-                        "error": "Invalid metadata filters; use only verified metadata fields and values.",
-                        "metadata_validation": validation_metadata,
-                    }
-                    tool_messages[tool_call.id] = tool_message(tool_call.id, payload)
-                    finish_tool_call_trace(
-                        trace_event,
-                        status="error",
-                        output=payload,
-                        metadata=validation_metadata,
-                        error="Invalid metadata filters",
-                    )
-                    continue
-                trace_event["parsed_arguments"] = jsonable(validation.args)
-                pending.append(
-                    _PendingToolCall(
-                        tool_call=tool_call,
-                        kind="grep",
-                        trace_event=trace_event,
-                        execute=execute_grep(
-                            validation.args,
-                            index=index,
-                            store_identifiers=store_identifiers,
-                            client=client,
-                            api_key=api_key,
-                            api_key_env=api_key_env,
-                        ),
-                        metadata_validation=validation.trace_metadata(),
-                    )
-                )
-                continue
-
-            if tool_name == "overview_search":
-                pending.append(
-                    _PendingToolCall(
-                        tool_call=tool_call,
-                        kind="overview_search",
-                        trace_event=trace_event,
-                        execute=execute_overview_search(
-                            parsed.model_dump(mode="json"),
-                            index=index,
-                            store_identifiers=store_identifiers,
-                            client=client,
-                            api_key=api_key,
-                            api_key_env=api_key_env,
-                        ),
-                    )
-                )
-                continue
-
-            if tool_name == "read_document":
-                pending.append(
-                    _PendingToolCall(
-                        tool_call=tool_call,
-                        kind="read_document",
-                        trace_event=trace_event,
-                        execute=execute_read_document(
-                            parsed.model_dump(mode="json"),
-                            index=index,
-                            client=client,
-                            api_key=api_key,
-                            api_key_env=api_key_env,
-                        ),
-                    )
-                )
-                continue
-
-            if tool_name == "get_chunks":
-                pending.append(
-                    _PendingToolCall(
-                        tool_call=tool_call,
-                        kind="get_chunks",
-                        trace_event=trace_event,
-                        execute=execute_get_chunks(
-                            parsed.model_dump(mode="json"),
-                            index=index,
-                            client=client,
-                            api_key=api_key,
-                            api_key_env=api_key_env,
-                        ),
-                    )
-                )
-                continue
-
-            if tool_name == "prune_context":
-                try:
-                    turn_chunk_keys = {
-                        index.refs.chunk_key_for_id(chunk_id) for chunk_id in parsed.chunk_ids
-                    }
-                    turn_document_keys = {
-                        index.refs.document_key_for_id(document_id)
-                        for document_id in parsed.document_ids
-                    }
-                except ValueError as exc:
-                    tool_messages[tool_call.id] = tool_error(tool_call.id, str(exc))
-                    finish_tool_call_trace(
-                        trace_event,
-                        status="error",
-                        error=str(exc),
-                    )
-                    continue
-                prune_chunk_keys.update(turn_chunk_keys)
-                prune_document_keys.update(turn_document_keys)
-                index.mark_pruned(
-                    chunk_keys=turn_chunk_keys,
-                    document_keys=turn_document_keys,
-                )
-                payload = {
-                    "tool": "prune_context",
-                    "chunk_ids": parsed.chunk_ids,
-                    "document_ids": parsed.document_ids,
-                }
-                tool_messages[tool_call.id] = tool_message(tool_call.id, payload)
-                finish_tool_call_trace(trace_event, output=payload)
-                continue
-
-            tool_messages[tool_call.id] = tool_error(tool_call.id, f"Unknown tool: {tool_name}")
-            finish_tool_call_trace(
-                trace_event,
-                status="error",
-                error=f"Unknown tool: {tool_name}",
-            )
-
-    except BaseException:
-        for entry in pending:
-            entry.execute.close()
-        raise
-    tools_dispatched = time.perf_counter()
     outcomes = (
-        await asyncio.gather(*(entry.execute for entry in pending), return_exceptions=True)
-        if pending
+        await asyncio.gather(*(entry.execute for entry in state.pending), return_exceptions=True)
+        if state.pending
         else []
     )
-    result_processing_started = time.perf_counter()
-    for entry, result in zip(pending, outcomes, strict=True):
-        if isinstance(result, BaseException) and not isinstance(result, Exception):
-            # Cancellation (and friends) must abort the rollout, never
-            # degrade into model-visible tool feedback.
-            raise result
-        tool_call = entry.tool_call
-        trace_event = entry.trace_event
-        if isinstance(result, Exception):
-            tool_messages[tool_call.id] = tool_error(tool_call.id, str(result))
-            finish_tool_call_trace(
-                trace_event,
-                status="error",
-                error=str(result),
-                error_kind=error_kind(result),
-            )
-            continue
+    clock.mark("gathered")
+    _record_tool_outcomes(outcomes, state)
+    clock.mark("recorded")
 
-        if isinstance(result, ToolOutcome):
-            payload, metadata = result.payload, result.query
-            metadata["source"] = f"searcher_{entry.kind}"
-            metadata.update(entry.metadata_validation)
-            metadata["zero_result_filtered_search_count"] = zero_result_filtered_search_count(
-                metadata
-            )
-            queries_made.append(metadata)
-            tool_messages[tool_call.id] = tool_message(tool_call.id, payload)
-            finish_tool_call_trace(
-                trace_event,
-                output=payload,
-                metadata=metadata,
-            )
-            continue
-
-        tool_messages[tool_call.id] = tool_message(tool_call.id, result)
-        payload_error = agent_caused_payload_error(result)
-        finish_tool_call_trace(
-            trace_event,
-            status="error" if payload_error else "success",
-            output=result,
-            error=payload_error,
-            error_kind=AGENT_ERROR_KIND if payload_error else None,
-        )
-    result_processing_seconds = time.perf_counter() - result_processing_started
-
-    tools_collected = time.perf_counter()
-
-    baseline_count_started = time.perf_counter()
     context_baseline = (
         max(context_tokens_baseline, await _estimate_messages_tokens_off_loop(messages))
         if context_tokens_baseline is not None
         else 0
     )
-    baseline_count_finished = time.perf_counter()
-
-    truncation_started = time.perf_counter()
+    clock.mark("baseline_counted")
     if context_tokens_baseline is not None:
         # Truncation re-serializes and re-counts every clipped payload: CPU
         # work, kept off the event loop. Sequential await, so the mutations it
@@ -1299,56 +1371,318 @@ async def _handle_searcher_tool_calls(
         await asyncio.to_thread(
             _truncate_round_tool_messages,
             tool_calls,
-            tool_messages,
-            tool_trace=tool_trace,
-            index=index,
+            state.tool_messages,
+            tool_trace=state.tool_trace,
+            index=config.index,
             context_tokens_baseline=context_baseline,
         )
-    truncation_finished = time.perf_counter()
-
-    append_started = time.perf_counter()
-    media_messages: list[dict[str, Any]] = []
-    for tool_call in tool_calls:
-        message = tool_messages.get(tool_call.id)
-        if message is not None:
-            messages.append(message)
-            media_messages.extend(media_messages_for_tool_message(message))
-    messages.extend(media_messages)
-    append_finished = time.perf_counter()
-
-    redaction_started = time.perf_counter()
-    if prune_chunk_keys or prune_document_keys:
-        redact_messages(
-            messages,
-            refs=index.refs,
-            chunk_keys=prune_chunk_keys,
-            document_keys=prune_document_keys,
-        )
-    redaction_finished = time.perf_counter()
+    clock.mark("truncated")
+    _append_round_messages(messages, tool_calls, state)
+    clock.mark("appended")
+    _redact_pruned_context(messages, config.index, state)
+    clock.mark("redacted")
 
     emit_bridge_timing(
         "tool_results_prepared",
-        agent="fast_searcher",
-        iteration=agent_iteration,
+        agent=AGENT_NAME,
+        iteration=iteration,
         tool_call_count=len(tool_calls),
-        remote_tool_count=len(pending),
-        pruned_context=bool(prune_chunk_keys or prune_document_keys),
+        remote_tool_count=len(state.pending),
+        pruned_context=state.pruned_context,
         message_count=len(messages),
-        setup_and_dispatch_ms=round((tools_dispatched - timing_started) * 1000, 3),
-        await_and_collect_ms=round((tools_collected - tools_dispatched) * 1000, 3),
-        result_processing_ms=round(result_processing_seconds * 1000, 3),
-        baseline_token_count_ms=round((baseline_count_finished - baseline_count_started) * 1000, 3),
-        truncate_and_token_count_ms=round((truncation_finished - truncation_started) * 1000, 3),
-        append_tool_messages_ms=round((append_finished - append_started) * 1000, 3),
-        redact_pruned_context_ms=round((redaction_finished - redaction_started) * 1000, 3),
-        total_ms=round((redaction_finished - timing_started) * 1000, 3),
+        setup_and_dispatch_ms=clock.ms("start", "dispatched"),
+        await_and_collect_ms=clock.ms("dispatched", "recorded"),
+        result_processing_ms=clock.ms("gathered", "recorded"),
+        baseline_token_count_ms=clock.ms("recorded", "baseline_counted"),
+        truncate_and_token_count_ms=clock.ms("baseline_counted", "truncated"),
+        append_tool_messages_ms=clock.ms("truncated", "appended"),
+        redact_pruned_context_ms=clock.ms("appended", "redacted"),
+        total_ms=clock.ms("start", "redacted"),
     )
 
     return SearcherToolRound(
-        final=final_result,
-        queries=queries_made,
-        trace=tool_trace,
-        pruned_context=bool(prune_chunk_keys or prune_document_keys),
+        final=state.final_result,
+        queries=state.queries_made,
+        trace=state.tool_trace,
+        pruned_context=state.pruned_context,
+    )
+
+
+def _dispatch_tool_calls(
+    tool_calls: Sequence[Any],
+    config: _RoundConfig,
+    state: _RoundState,
+) -> None:
+    """Decode every call the model made this round and start the remote ones.
+
+    Final calls, prune calls, and every rejection are answered inline; the
+    remote executors land in ``state.pending`` for the caller to gather.
+    """
+    accepted_calls = 0
+    # The dispatch loop creates the tool coroutines eagerly; if it raises
+    # before the gather, close them so nothing is silently dropped un-awaited.
+    try:
+        for call_index, tool_call in enumerate(tool_calls, 1):
+            trace_event = start_tool_call_trace(
+                agent=AGENT_NAME,
+                iteration=state.iteration,
+                tool_call=tool_call,
+                call_index=call_index,
+                group_size=len(tool_calls),
+            )
+            state.tool_trace.append(trace_event)
+            if accepted_calls >= MAX_PARALLEL_TOOL_CALLS:
+                _fail_tool_call(
+                    state,
+                    tool_call,
+                    trace_event,
+                    f"Too many parallel tool calls requested. Maximum is {MAX_PARALLEL_TOOL_CALLS}.",
+                )
+                continue
+            accepted_calls += 1
+            _dispatch_tool_call(tool_call, trace_event, config=config, state=state)
+    except BaseException:
+        for entry in state.pending:
+            entry.execute.close()
+        raise
+
+
+def _dispatch_tool_call(
+    tool_call: Any,
+    trace_event: dict[str, Any],
+    *,
+    config: _RoundConfig,
+    state: _RoundState,
+) -> None:
+    """Route one accepted call to its handler by tool name."""
+    tool_name = tool_call.function.name
+    if tool_name == FINAL_TOOL_NAME:
+        _record_final_ranking(tool_call, trace_event, config=config, state=state)
+        return
+
+    parsed = parse_tool_args(tool_call, _SEARCHER_ARG_SCHEMAS.get(tool_name))
+    if isinstance(parsed, dict) and "error" in parsed:
+        _fail_tool_call(state, tool_call, trace_event, parsed["error"])
+        return
+    trace_event["parsed_arguments"] = jsonable(parsed)
+
+    if tool_name == "prune_context":
+        _apply_prune_call(parsed, tool_call, trace_event, config=config, state=state)
+        return
+    filtered_search = config.filtered_search_executors.get(tool_name)
+    if filtered_search is not None:
+        _dispatch_filtered_search(
+            filtered_search, parsed, tool_call, trace_event, config=config, state=state
+        )
+        return
+    plain_retrieval = config.plain_retrieval_executors.get(tool_name)
+    if plain_retrieval is not None:
+        state.pending.append(
+            _PendingToolCall(
+                tool_call=tool_call,
+                kind=tool_name,
+                trace_event=trace_event,
+                execute=plain_retrieval(parsed.model_dump(mode="json")),
+            )
+        )
+        return
+    _fail_tool_call(state, tool_call, trace_event, f"Unknown tool: {tool_name}")
+
+
+def _record_final_ranking(
+    tool_call: Any,
+    trace_event: dict[str, Any],
+    *,
+    config: _RoundConfig,
+    state: _RoundState,
+) -> None:
+    if config.answers_in_text:
+        # The tool was never offered this round, so a call naming it is the
+        # model reproducing a shape it no longer has. Point it at the turn
+        # that actually ends the episode rather than parsing the payload.
+        _fail_tool_call(
+            state,
+            tool_call,
+            trace_event,
+            "submit_ranking is not available; reply with your final answer "
+            "as plain text with no tool calls.",
+        )
+        return
+    try:
+        ranking = parse_ranking(tool_call.function.arguments, require_answer=config.requires_answer)
+        validate_ranked_chunk_ids(
+            ranking, config.index, top_k=config.top_k, strict_top_k=config.strict_top_k
+        )
+        state.final_result = ranking
+        finish_tool_call_trace(
+            trace_event, output={"ranking": ranking_trace_payload(ranking, config.index)}
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        _fail_tool_call(state, tool_call, trace_event, f"Failed to parse ranking: {exc}")
+
+
+def _dispatch_filtered_search(
+    executor: _Executor,
+    parsed: BaseModel,
+    tool_call: Any,
+    trace_event: dict[str, Any],
+    *,
+    config: _RoundConfig,
+    state: _RoundState,
+) -> None:
+    """Vet the call's metadata filters against the corpus registry, then start it."""
+    validation = validate_metadata_filter_args(
+        parsed.model_dump(mode="json"),
+        registry=build_metadata_registry(
+            initial_metadata_facets=config.initial_metadata_facets, index=config.index
+        ),
+    )
+    if not validation.valid:
+        _reject_metadata_filters(tool_call, trace_event, validation.trace_metadata(), state)
+        return
+    trace_event["parsed_arguments"] = jsonable(validation.args)
+    state.pending.append(
+        _PendingToolCall(
+            tool_call=tool_call,
+            kind=tool_call.function.name,
+            trace_event=trace_event,
+            execute=executor(validation.args),
+            metadata_validation=validation.trace_metadata(),
+        )
+    )
+
+
+def _reject_metadata_filters(
+    tool_call: Any,
+    trace_event: dict[str, Any],
+    validation_metadata: dict[str, Any],
+    state: _RoundState,
+) -> None:
+    payload = {
+        "tool": tool_call.function.name,
+        "error": "Invalid metadata filters; use only verified metadata fields and values.",
+        "metadata_validation": validation_metadata,
+    }
+    state.tool_messages[tool_call.id] = tool_message(tool_call.id, payload)
+    finish_tool_call_trace(
+        trace_event,
+        status="error",
+        output=payload,
+        metadata=validation_metadata,
+        error="Invalid metadata filters",
+    )
+
+
+def _apply_prune_call(
+    parsed: PruneContextArgs,
+    tool_call: Any,
+    trace_event: dict[str, Any],
+    *,
+    config: _RoundConfig,
+    state: _RoundState,
+) -> None:
+    """Resolve the prune's handles and mark them pruned in the index.
+
+    The transcript is redacted once, after the round's messages are appended,
+    so the keys are collected on ``state`` rather than applied here.
+    """
+    refs = config.index.refs
+    try:
+        chunk_keys = {refs.chunk_key_for_id(chunk_id) for chunk_id in parsed.chunk_ids}
+        document_keys = {
+            refs.document_key_for_id(document_id) for document_id in parsed.document_ids
+        }
+    except ValueError as exc:
+        _fail_tool_call(state, tool_call, trace_event, str(exc))
+        return
+    state.prune_chunk_keys.update(chunk_keys)
+    state.prune_document_keys.update(document_keys)
+    config.index.mark_pruned(chunk_keys=chunk_keys, document_keys=document_keys)
+    payload = {
+        "tool": "prune_context",
+        "chunk_ids": parsed.chunk_ids,
+        "document_ids": parsed.document_ids,
+    }
+    state.tool_messages[tool_call.id] = tool_message(tool_call.id, payload)
+    finish_tool_call_trace(trace_event, output=payload)
+
+
+def _record_tool_outcomes(outcomes: Sequence[Any], state: _RoundState) -> None:
+    """Turn each gathered outcome into a tool message and a finished trace event."""
+    for entry, result in zip(state.pending, outcomes, strict=True):
+        if isinstance(result, BaseException) and not isinstance(result, Exception):
+            # Cancellation (and friends) must abort the rollout, never
+            # degrade into model-visible tool feedback.
+            raise result
+        if isinstance(result, Exception):
+            _fail_tool_call(
+                state,
+                entry.tool_call,
+                entry.trace_event,
+                str(result),
+                error_kind=error_kind(result),
+            )
+        elif isinstance(result, ToolOutcome):
+            _record_search_outcome(entry, result, state)
+        else:
+            _record_payload(entry, result, state)
+
+
+def _record_search_outcome(
+    entry: _PendingToolCall, outcome: ToolOutcome, state: _RoundState
+) -> None:
+    """A corpus search's payload for the model, and its query for the rollout record."""
+    query = outcome.query
+    query["source"] = f"searcher_{entry.kind}"
+    query.update(entry.metadata_validation)
+    query["zero_result_filtered_search_count"] = zero_result_filtered_search_count(query)
+    state.queries_made.append(query)
+    state.tool_messages[entry.tool_call.id] = tool_message(entry.tool_call.id, outcome.payload)
+    finish_tool_call_trace(entry.trace_event, output=outcome.payload, metadata=query)
+
+
+def _record_payload(entry: _PendingToolCall, payload: Any, state: _RoundState) -> None:
+    """A lookup's payload for the model; a model-caused failure inside it is an error."""
+    state.tool_messages[entry.tool_call.id] = tool_message(entry.tool_call.id, payload)
+    payload_error = agent_caused_payload_error(payload)
+    finish_tool_call_trace(
+        entry.trace_event,
+        status="error" if payload_error else "success",
+        output=payload,
+        error=payload_error,
+        error_kind=AGENT_ERROR_KIND if payload_error else None,
+    )
+
+
+def _append_round_messages(
+    messages: list[dict[str, Any]],
+    tool_calls: Sequence[Any],
+    state: _RoundState,
+) -> None:
+    """Append the round's tool messages in call order, then the media they carry."""
+    media_messages: list[dict[str, Any]] = []
+    for tool_call in tool_calls:
+        message = state.tool_messages.get(tool_call.id)
+        if message is None:
+            continue
+        messages.append(message)
+        media_messages.extend(media_messages_for_tool_message(message))
+    messages.extend(media_messages)
+
+
+def _redact_pruned_context(
+    messages: list[dict[str, Any]],
+    index: ChunkIndex,
+    state: _RoundState,
+) -> None:
+    """Strip the content the round pruned from the history the model reads next."""
+    if not state.pruned_context:
+        return
+    redact_messages(
+        messages,
+        refs=index.refs,
+        chunk_keys=state.prune_chunk_keys,
+        document_keys=state.prune_document_keys,
     )
 
 
@@ -1415,6 +1749,23 @@ _SEARCHER_ARG_SCHEMAS: dict[str, type[BaseModel]] = {
     "get_chunks": GetChunksArgs,
     "prune_context": PruneContextArgs,
 }
+
+
+class _PhaseClock:
+    """Named wall-clock marks for one bridge-timing event."""
+
+    def __init__(self) -> None:
+        self._marks: dict[str, float] = {"start": time.perf_counter()}
+
+    def mark(self, name: str) -> None:
+        self._marks[name] = time.perf_counter()
+
+    def ms(self, start: str, end: str) -> float:
+        return _elapsed_ms(self._marks[start], self._marks[end])
+
+
+def _elapsed_ms(started: float, finished: float) -> float:
+    return round((finished - started) * 1000, 3)
 
 
 def _fast_searcher_prompt_snapshot(

@@ -56,6 +56,7 @@ from agent_harness.retrieval import (
     MetadataFacetsRequest,
     SearchRequest,
 )
+from agent_harness.schemas import AnswerMode
 
 __all__ = [
     "AgentEvent",
@@ -437,6 +438,7 @@ def stream_fast_agentic_search(
     media_content: MediaContentInput = None,
     tuning: HarnessTuning | None = None,
     as_of: date | None = None,
+    answer_mode: AnswerMode = "none",
 ) -> AsyncIterator[AgentEvent]:
     """Drive the fast searcher, yielding progress events as it runs.
 
@@ -464,6 +466,7 @@ def stream_fast_agentic_search(
             generation_fn=_EmittingGeneration(channel, generation_fn),
             tuning=tuning,
             as_of=as_of,
+            answer_mode=answer_mode,
         )
 
     return _stream(
