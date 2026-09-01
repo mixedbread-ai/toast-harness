@@ -36,6 +36,7 @@ from agent_harness.retrieval import (
     RetrievalClient,
     SyncRetrievalClientAdapter,
 )
+from agent_harness.schemas import AnswerMode
 from agent_harness.versions import build_version_manifest
 
 
@@ -60,6 +61,7 @@ async def run_searcher_async(
     media_content: MediaContentInput = None,
     tuning: HarnessTuning | None = None,
     as_of: date | None = None,
+    answer_mode: AnswerMode = "none",
 ) -> dict[str, Any]:
     """Async native: input -> fixed searcher -> Responses API rollout record."""
     require_generation_fn(generation_fn)
@@ -78,6 +80,7 @@ async def run_searcher_async(
         generation_fn=generation_fn,
         tuning=tuning,
         as_of=as_of,
+        answer_mode=answer_mode,
     )
     runtime_s = perf_counter() - started
     return build_rollout_result(
@@ -118,6 +121,7 @@ class SearcherExecutionPolicy:
         media_content: MediaContentInput = None,
         tuning: HarnessTuning | None = None,
         as_of: date | None = None,
+        answer_mode: AnswerMode = "none",
     ) -> dict[str, Any]:
         return run_coroutine_sync(
             run_searcher_async(
@@ -136,6 +140,7 @@ class SearcherExecutionPolicy:
                 media_content=media_content,
                 tuning=tuning,
                 as_of=as_of,
+                answer_mode=answer_mode,
             )
         )
 
@@ -157,6 +162,7 @@ def run_searcher(
     generation_fn: GenerationFn | None = None,
     tuning: HarnessTuning | None = None,
     as_of: date | None = None,
+    answer_mode: AnswerMode = "none",
 ) -> dict[str, Any]:
     """Convenience function for input -> fixed searcher -> Responses API rollout."""
     return SearcherExecutionPolicy(generation_fn=generation_fn).run(
@@ -174,6 +180,7 @@ def run_searcher(
         media_content=media_content,
         tuning=tuning,
         as_of=as_of,
+        answer_mode=answer_mode,
     )
 
 
@@ -214,10 +221,14 @@ def build_rollout_result(
             retrieval=retrieval,
         ),
     }
-    return {
+    record = {
         "openai": openai,
         "retrieval": retrieval,
+        "answer_mode": result.get("answer_mode", "none"),
     }
+    if retrieval.get("answer"):
+        record["answer"] = retrieval["answer"]
+    return record
 
 
 def build_retrieval(result: Mapping[str, Any]) -> dict[str, Any]:
@@ -225,6 +236,7 @@ def build_retrieval(result: Mapping[str, Any]) -> dict[str, Any]:
         {
             "ranked_ids": ranked_ids(result),
             "chunks": list(result.get("chunks") or []),
+            "answer": result.get("answer"),
             "ranking_strategy": result.get("ranking_strategy"),
             "top_k": result.get("top_k"),
             "strict_top_k": result.get("strict_top_k"),
@@ -271,6 +283,7 @@ def build_rollout_metadata(
             "tool_trace": tool_trace,
             "queries_made": result.get("queries_made") or [],
             "id_mapping": result.get("id_mapping"),
+            "answer_mode": result.get("answer_mode"),
         },
         "retrieval": {
             "ranked_ids": list(retrieval.get("ranked_ids") or []),

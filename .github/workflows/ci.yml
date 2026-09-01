@@ -60,3 +60,9 @@ jobs:
       # The harness gate: the whole suite, and it is expected fully green.
       - name: Harness gate
         run: /tmp/gate/bin/python -m pytest -q tests/agent_harness
+
+      # The Completions API recipes under completions/ are not in the wheel; their
+      # tests import them from the source tree and drive them against a scripted
+      # client, so the gate venv already has everything they need.
+      - name: Completions recipes
+        run: /tmp/gate/bin/python -m pytest -q tests/completions

@@ -927,133 +927,28 @@ async def execute_get_chunks(
     api_key_env: str | None = None,
 ) -> dict[str, Any]:
     chunk_ids = [str(chunk_id).strip() for chunk_id in args["chunk_ids"]]
-    results: list[dict[str, Any]] = []
-    restored_chunk_ids: list[str] = []
-    # IDs the model invented or cannot reach. Reported separately from the
-    # per-result errors below so the caller can mark the trace event agent-caused:
-    # a "Chunk not found" from the store is not the model's mistake, an
-    # unresolvable chunk_id is.
-    invalid_chunk_ids: list[str] = []
-    fetched: list[tuple[str, dict[str, Any]]] = []
-
-    for chunk_id in chunk_ids:
-        try:
-            key = index.refs.chunk_key_for_id(chunk_id)
-        except ValueError as exc:
-            results.append({"chunk_id": chunk_id, "error": str(exc)})
-            invalid_chunk_ids.append(chunk_id)
-            continue
-        if not index.is_visible_chunk(key):
-            results.append(
-                {
-                    "chunk_id": chunk_id,
-                    "error": "chunk_id is not available in this agent context",
-                }
-            )
-            invalid_chunk_ids.append(chunk_id)
-            continue
-
-        result = await get_chunk(
-            file_id=key[1],
-            store_id=key[0],
-            chunk_index=key[2],
-            client=client,
-            api_key=api_key,
-            api_key_env=api_key_env,
-        )
-        if "error" in result:
-            results.append({"chunk_id": chunk_id, "error": result["error"]})
-            continue
-
-        index.add_chunk(result, restore=True)
-        restored_chunk_ids.append(chunk_id)
-        serialized = serialize_agent_chunk(result, refs=index.refs)
-        fetched.append((chunk_id, serialized))
-        results.append(serialized)
-
-    clipped_chunk_ids: list[str] = []
-    budget_clipped_count = 0
-    if fetched:
-        sizes = [estimate_payload_tokens(item) for _, item in fetched]
-        # A single-id request is an explicit escalation ("show me this one"), so the
-        # per-chunk cap is waived and the chunk may fill the whole call budget.
-        per_chunk = config.GET_CHUNKS_CHUNK_TOKEN_LIMIT if len(fetched) > 1 else 0
-        # What each chunk will occupy after its per-chunk clip; the allocator splits the rest.
-        effective = [
-            min(size, per_chunk + _BUDGET_CLIP_SLACK_TOKENS) if 0 < per_chunk < size else size
-            for size in sizes
-        ]
-
-        def envelope_tokens(reporting: Mapping[str, Any]) -> int:
-            return estimate_payload_tokens(
-                {
-                    "tool": "get_chunks",
-                    "requested_chunk_ids": chunk_ids,
-                    "restored_chunk_ids": restored_chunk_ids,
-                    "results": [entry for entry in results if "error" in entry],
-                    **reporting,
-                }
-            )
-
-        def allocate(item_budget: int) -> list[int]:
-            caps = _spread_token_budget(effective, item_budget, floor=config.MIN_ALLOCATION_TOKENS)
-            return [min(cap, per_chunk) if per_chunk > 0 else cap for cap in caps]
-
-        reporting: dict[str, Any] = {}
-        # The reporting keys consume payload budget too, so allocate against an
-        # envelope that includes them; the notice count feeds the notice text,
-        # so iterate the (tiny) fixpoint until it stabilises.
-        for _ in range(3):
-            item_budget = max(
-                config.MIN_ALLOCATION_TOKENS,
-                config.TOOL_CALL_PAYLOAD_TOKEN_BUDGET - envelope_tokens(reporting),
-            )
-            final_caps = allocate(item_budget)
-            planned_clipped = [
-                chunk_id
-                for (chunk_id, _), cap, size in zip(fetched, final_caps, sizes, strict=True)
-                if size > cap
-            ]
-            planned_budget_count = sum(
-                1
-                for (_, _), cap, size in zip(fetched, final_caps, sizes, strict=True)
-                if size > cap and cap < min(size, per_chunk if per_chunk > 0 else size)
-            )
-            next_reporting: dict[str, Any] = {}
-            if planned_clipped:
-                next_reporting = {
-                    "clipped_chunk_ids": planned_clipped,
-                    "clipped_chunk_count": len(planned_clipped),
-                }
-                if planned_budget_count:
-                    next_reporting["budget_notice"] = _payload_budget_notice(
-                        planned_budget_count, config.TOOL_CALL_PAYLOAD_TOKEN_BUDGET
-                    )
-            if next_reporting == reporting:
-                break
-            reporting = next_reporting
-        for (chunk_id, item), cap, size in zip(fetched, final_caps, sizes, strict=True):
-            if size <= cap:
-                continue
-            # Report from what actually clipped: a chunk whose oversize sits in
-            # non-clippable fields keeps its text and is not counted.
-            if _clip_chunk_to_cap(item, cap, estimated=size):
-                clipped_chunk_ids.append(chunk_id)
-                if cap < min(size, per_chunk if per_chunk > 0 else size):
-                    budget_clipped_count += 1
+    fetch = await _fetch_requested_chunks(
+        chunk_ids, index=index, client=client, api_key=api_key, api_key_env=api_key_env
+    )
+    clipped_chunk_ids, budget_clipped_count = _clip_fetched_chunks_to_budget(
+        fetch.fetched,
+        requested_chunk_ids=chunk_ids,
+        restored_chunk_ids=fetch.restored_chunk_ids,
+        results=fetch.results,
+    )
 
     payload: dict[str, Any] = {
         "tool": "get_chunks",
         "requested_chunk_ids": chunk_ids,
-        "results": results,
-        "restored_chunk_ids": restored_chunk_ids,
+        "results": fetch.results,
+        "restored_chunk_ids": fetch.restored_chunk_ids,
     }
-    if invalid_chunk_ids:
-        payload["invalid_chunk_ids"] = invalid_chunk_ids
+    if fetch.invalid_chunk_ids:
+        payload["invalid_chunk_ids"] = fetch.invalid_chunk_ids
     if clipped_chunk_ids:
         payload["clipped_chunk_ids"] = clipped_chunk_ids
         payload["clipped_chunk_count"] = len(clipped_chunk_ids)
-    if len(fetched) == 1 and clipped_chunk_ids:
+    if len(fetch.fetched) == 1 and clipped_chunk_ids:
         # The escalation ceiling: a lone chunk still over the call budget cannot be
         # shown in full by ANY request — say so instead of inviting a retry.
         payload["budget_notice"] = (
@@ -1069,6 +964,156 @@ async def execute_get_chunks(
     return payload
 
 
+@dataclass(slots=True)
+class _FetchedChunks:
+    """What resolving and fetching the requested chunk ids produced.
+
+    ``invalid_chunk_ids`` are ids the model invented or cannot reach, reported
+    separately from the per-result errors so the caller can mark the trace
+    event agent-caused: a "Chunk not found" from the store is not the model's
+    mistake, an unresolvable chunk_id is.
+    """
+
+    results: list[dict[str, Any]]
+    restored_chunk_ids: list[str]
+    invalid_chunk_ids: list[str]
+    fetched: list[tuple[str, dict[str, Any]]]
+
+
+async def _fetch_requested_chunks(
+    chunk_ids: Sequence[str],
+    *,
+    index: ChunkIndex,
+    client: AsyncRetrievalClient | None,
+    api_key: str | None,
+    api_key_env: str | None,
+) -> _FetchedChunks:
+    fetch = _FetchedChunks(results=[], restored_chunk_ids=[], invalid_chunk_ids=[], fetched=[])
+    for chunk_id in chunk_ids:
+        try:
+            key = index.refs.chunk_key_for_id(chunk_id)
+        except ValueError as exc:
+            fetch.results.append({"chunk_id": chunk_id, "error": str(exc)})
+            fetch.invalid_chunk_ids.append(chunk_id)
+            continue
+        if not index.is_visible_chunk(key):
+            fetch.results.append(
+                {
+                    "chunk_id": chunk_id,
+                    "error": "chunk_id is not available in this agent context",
+                }
+            )
+            fetch.invalid_chunk_ids.append(chunk_id)
+            continue
+
+        result = await get_chunk(
+            file_id=key[1],
+            store_id=key[0],
+            chunk_index=key[2],
+            client=client,
+            api_key=api_key,
+            api_key_env=api_key_env,
+        )
+        if "error" in result:
+            fetch.results.append({"chunk_id": chunk_id, "error": result["error"]})
+            continue
+
+        index.add_chunk(result, restore=True)
+        fetch.restored_chunk_ids.append(chunk_id)
+        serialized = serialize_agent_chunk(result, refs=index.refs)
+        fetch.fetched.append((chunk_id, serialized))
+        fetch.results.append(serialized)
+    return fetch
+
+
+def _clip_fetched_chunks_to_budget(
+    fetched: list[tuple[str, dict[str, Any]]],
+    *,
+    requested_chunk_ids: list[str],
+    restored_chunk_ids: list[str],
+    results: list[dict[str, Any]],
+) -> tuple[list[str], int]:
+    """Clip the fetched chunks in place to the per-call payload budget.
+
+    Returns the chunk ids that lost text and how many of them lost it to the
+    call budget rather than to the per-chunk cap.
+    """
+    if not fetched:
+        return [], 0
+
+    sizes = [estimate_payload_tokens(item) for _, item in fetched]
+    # A single-id request is an explicit escalation ("show me this one"), so the
+    # per-chunk cap is waived and the chunk may fill the whole call budget.
+    per_chunk = config.GET_CHUNKS_CHUNK_TOKEN_LIMIT if len(fetched) > 1 else 0
+    # What each chunk will occupy after its per-chunk clip; the allocator splits the rest.
+    effective = [
+        min(size, per_chunk + _BUDGET_CLIP_SLACK_TOKENS) if 0 < per_chunk < size else size
+        for size in sizes
+    ]
+
+    def envelope_tokens(reporting: Mapping[str, Any]) -> int:
+        return estimate_payload_tokens(
+            {
+                "tool": "get_chunks",
+                "requested_chunk_ids": requested_chunk_ids,
+                "restored_chunk_ids": restored_chunk_ids,
+                "results": [entry for entry in results if "error" in entry],
+                **reporting,
+            }
+        )
+
+    def allocate(item_budget: int) -> list[int]:
+        caps = _spread_token_budget(effective, item_budget, floor=config.MIN_ALLOCATION_TOKENS)
+        return [min(cap, per_chunk) if per_chunk > 0 else cap for cap in caps]
+
+    reporting: dict[str, Any] = {}
+    # The reporting keys consume payload budget too, so allocate against an
+    # envelope that includes them; the notice count feeds the notice text,
+    # so iterate the (tiny) fixpoint until it stabilises.
+    for _ in range(3):
+        item_budget = max(
+            config.MIN_ALLOCATION_TOKENS,
+            config.TOOL_CALL_PAYLOAD_TOKEN_BUDGET - envelope_tokens(reporting),
+        )
+        final_caps = allocate(item_budget)
+        planned_clipped = [
+            chunk_id
+            for (chunk_id, _), cap, size in zip(fetched, final_caps, sizes, strict=True)
+            if size > cap
+        ]
+        planned_budget_count = sum(
+            1
+            for (_, _), cap, size in zip(fetched, final_caps, sizes, strict=True)
+            if size > cap and cap < min(size, per_chunk if per_chunk > 0 else size)
+        )
+        next_reporting: dict[str, Any] = {}
+        if planned_clipped:
+            next_reporting = {
+                "clipped_chunk_ids": planned_clipped,
+                "clipped_chunk_count": len(planned_clipped),
+            }
+            if planned_budget_count:
+                next_reporting["budget_notice"] = _payload_budget_notice(
+                    planned_budget_count, config.TOOL_CALL_PAYLOAD_TOKEN_BUDGET
+                )
+        if next_reporting == reporting:
+            break
+        reporting = next_reporting
+
+    clipped_chunk_ids: list[str] = []
+    budget_clipped_count = 0
+    for (chunk_id, item), cap, size in zip(fetched, final_caps, sizes, strict=True):
+        if size <= cap:
+            continue
+        # Report from what actually clipped: a chunk whose oversize sits in
+        # non-clippable fields keeps its text and is not counted.
+        if _clip_chunk_to_cap(item, cap, estimated=size):
+            clipped_chunk_ids.append(chunk_id)
+            if cap < min(size, per_chunk if per_chunk > 0 else size):
+                budget_clipped_count += 1
+    return clipped_chunk_ids, budget_clipped_count
+
+
 async def execute_read_document(
     args: Mapping[str, Any],
     *,
@@ -1077,36 +1122,10 @@ async def execute_read_document(
     api_key: str | None = None,
     api_key_env: str | None = None,
 ) -> dict[str, Any]:
-    # ``invalid_request`` marks the failure as the model's own (an id it invented,
-    # cannot reach, or paired wrong) so the caller can mark the trace event
-    # agent-caused; provider failures raise out of this function instead.
-    try:
-        requested_doc_key = index.refs.document_key_for_id(str(args["document_id"]))
-        requested_chunk_key = index.refs.chunk_key_for_id(str(args["chunk_id"]))
-    except ValueError as exc:
-        return {"tool": "read_document", "error": str(exc), "invalid_request": True}
-    if not index.is_visible_document(requested_doc_key):
-        return {
-            "tool": "read_document",
-            "document_id": str(args["document_id"]),
-            "error": "document_id is not available in this agent context",
-            "invalid_request": True,
-        }
-    if not index.is_visible_chunk(requested_chunk_key):
-        return {
-            "tool": "read_document",
-            "chunk_id": str(args["chunk_id"]),
-            "error": "chunk_id is not available in this agent context",
-            "invalid_request": True,
-        }
-    if document_key_from_parts(requested_chunk_key[0], requested_chunk_key[1]) != requested_doc_key:
-        return {
-            "tool": "read_document",
-            "document_id": str(args["document_id"]),
-            "chunk_id": str(args["chunk_id"]),
-            "error": "chunk_id does not belong to document_id",
-            "invalid_request": True,
-        }
+    requested_keys, invalid_request = _resolve_read_document_request(args, index)
+    if invalid_request is not None:
+        return invalid_request
+    requested_doc_key, requested_chunk_key = requested_keys
 
     raw_window_size = args.get("x", 1)
     window_size = max(int(1 if raw_window_size is None else raw_window_size), 0)
@@ -1130,19 +1149,12 @@ async def execute_read_document(
         [] if document_was_pruned else index.ingest_search_results(chunks, max_new_chunks=None)
     )
     new_chunk_keys = {chunk_key(new_chunk) for new_chunk in new_chunks}
-    window_chunks: list[dict[str, Any]] = []
-    seen_window_keys: set[ChunkKey] = set()
-    if not document_was_pruned:
-        for chunk in chunks:
-            key = chunk_key(chunk)
-            chunk_is_pruned = (
-                key in index.deleted_chunk_keys and key not in index.restored_chunk_keys
-            )
-            if key in seen_window_keys or chunk_is_pruned:
-                continue
-            seen_window_keys.add(key)
-            if key in new_chunk_keys or index.expose_chunk_reference(chunk):
-                window_chunks.append(index.get(key) or dict(chunk))
+    window_chunks = _visible_window_chunks(
+        chunks,
+        index=index,
+        new_chunk_keys=new_chunk_keys,
+        document_was_pruned=document_was_pruned,
+    )
     returned_chunk_keys = {chunk_key(chunk) for chunk in window_chunks}
     omitted_count = sum(1 for chunk in chunks if chunk_key(chunk) not in returned_chunk_keys)
     payload = {
@@ -1184,6 +1196,69 @@ async def execute_read_document(
             budget=budget,
         )
     return {key: value for key, value in payload.items() if value not in (None, "", [])}
+
+
+def _resolve_read_document_request(
+    args: Mapping[str, Any],
+    index: ChunkIndex,
+) -> tuple[tuple[DocumentKey, ChunkKey] | None, dict[str, Any] | None]:
+    """Resolve the request's ids to keys, or return the failure payload.
+
+    ``invalid_request`` marks the failure as the model's own (an id it
+    invented, cannot reach, or paired wrong) so the caller can mark the trace
+    event agent-caused; provider failures raise out of the executor instead.
+    """
+    try:
+        requested_doc_key = index.refs.document_key_for_id(str(args["document_id"]))
+        requested_chunk_key = index.refs.chunk_key_for_id(str(args["chunk_id"]))
+    except ValueError as exc:
+        return None, {"tool": "read_document", "error": str(exc), "invalid_request": True}
+    if not index.is_visible_document(requested_doc_key):
+        return None, {
+            "tool": "read_document",
+            "document_id": str(args["document_id"]),
+            "error": "document_id is not available in this agent context",
+            "invalid_request": True,
+        }
+    if not index.is_visible_chunk(requested_chunk_key):
+        return None, {
+            "tool": "read_document",
+            "chunk_id": str(args["chunk_id"]),
+            "error": "chunk_id is not available in this agent context",
+            "invalid_request": True,
+        }
+    if document_key_from_parts(requested_chunk_key[0], requested_chunk_key[1]) != requested_doc_key:
+        return None, {
+            "tool": "read_document",
+            "document_id": str(args["document_id"]),
+            "chunk_id": str(args["chunk_id"]),
+            "error": "chunk_id does not belong to document_id",
+            "invalid_request": True,
+        }
+    return (requested_doc_key, requested_chunk_key), None
+
+
+def _visible_window_chunks(
+    chunks: Sequence[Mapping[str, Any]],
+    *,
+    index: ChunkIndex,
+    new_chunk_keys: set[ChunkKey],
+    document_was_pruned: bool,
+) -> list[dict[str, Any]]:
+    """The window's chunks the agent may see: deduplicated, prunes dropped."""
+    if document_was_pruned:
+        return []
+    window_chunks: list[dict[str, Any]] = []
+    seen_window_keys: set[ChunkKey] = set()
+    for chunk in chunks:
+        key = chunk_key(chunk)
+        chunk_is_pruned = key in index.deleted_chunk_keys and key not in index.restored_chunk_keys
+        if key in seen_window_keys or chunk_is_pruned:
+            continue
+        seen_window_keys.add(key)
+        if key in new_chunk_keys or index.expose_chunk_reference(chunk):
+            window_chunks.append(index.get(key) or dict(chunk))
+    return window_chunks
 
 
 async def enrich_file_payload(
@@ -1849,6 +1924,28 @@ def _clip_chunk_to_cap(
     estimated = estimate_payload_tokens(payload) if estimated is None else estimated
     if estimated <= cap_tokens:
         return False
+    estimated, clipped, metadata_clipped = _shave_text_fields(
+        payload, cap_tokens, estimated=estimated, quantified=quantified
+    )
+    elided = _elide_oversize_metadata(payload, cap_tokens, estimated=estimated)
+    if metadata_clipped or elided:
+        payload["metadata_clipped"] = True
+    return clipped or elided
+
+
+def _shave_text_fields(
+    payload: dict[str, Any],
+    cap_tokens: int,
+    *,
+    estimated: int,
+    quantified: bool,
+) -> tuple[int, bool, bool]:
+    """Shorten the payload's string values in proportion to their length.
+
+    Returns the resulting estimate and whether any text or metadata value was
+    shortened. The chars-per-token ratio starts at the configured default and
+    adapts to what each pass actually removed.
+    """
     originals: dict[tuple[str, str], str] = {}
     keeps: dict[tuple[str, str], int] = {}
     chars_per_token = float(config.TOKEN_ESTIMATE_CHARS_PER_TOKEN)
@@ -1911,53 +2008,63 @@ def _clip_chunk_to_cap(
         elif removed_chars:
             chars_per_token = min(16.0, chars_per_token * 2)
 
+    return estimated, clipped, metadata_clipped
+
+
+def _elide_oversize_metadata(
+    payload: dict[str, Any],
+    cap_tokens: int,
+    *,
+    estimated: int,
+) -> bool:
+    """Replace metadata values with markers until the payload fits the cap.
+
+    Returns whether any value was elided or dropped.
+    """
     metadata = payload.get("metadata")
-    if estimated > cap_tokens and isinstance(metadata, dict):
-        # Elide the biggest values first; provider metadata is arbitrary JSON, so
-        # a value can be larger than the whole cap on its own. Anything bigger than
-        # its marker form is fair game when the payload is still over.
-        while estimated > cap_tokens:
-            by_size = sorted(
-                metadata.items(),
-                key=lambda item: len(json.dumps(item[1], ensure_ascii=False, default=str)),
-                reverse=True,
-            )
-            elided = False
-            for key, value in by_size:
-                serialized = json.dumps(value, ensure_ascii=False, default=str)
-                marker = {"_truncated": {"original_json_chars": len(serialized)}}
-                if len(serialized) <= len(json.dumps(marker)) + 16:
-                    continue
-                metadata[key] = marker
-                elided = True
-                clipped = True
-                metadata_clipped = True
-                estimated = estimate_payload_tokens(payload)
-                if estimated <= cap_tokens:
-                    break
-            if not elided:
-                break
-        # Last resort: when even the marker forms overshoot, drop the biggest
-        # remaining values entirely and leave a count so the model knows.
-        dropped_fields = 0
-        while estimated > cap_tokens and isinstance(metadata, dict) and metadata:
-            key = max(
-                metadata,
-                key=lambda k: len(k) + len(json.dumps(metadata[k], default=str)),
-            )
-            if len(key) + len(json.dumps(metadata[key], default=str)) < 24:
-                break
-            del metadata[key]
-            dropped_fields += 1
+    if estimated <= cap_tokens or not isinstance(metadata, dict):
+        return False
+    changed = False
+    # Elide the biggest values first; provider metadata is arbitrary JSON, so
+    # a value can be larger than the whole cap on its own. Anything bigger than
+    # its marker form is fair game when the payload is still over.
+    while estimated > cap_tokens:
+        by_size = sorted(
+            metadata.items(),
+            key=lambda item: len(json.dumps(item[1], ensure_ascii=False, default=str)),
+            reverse=True,
+        )
+        elided = False
+        for key, value in by_size:
+            serialized = json.dumps(value, ensure_ascii=False, default=str)
+            marker = {"_truncated": {"original_json_chars": len(serialized)}}
+            if len(serialized) <= len(json.dumps(marker)) + 16:
+                continue
+            metadata[key] = marker
+            elided = True
+            changed = True
             estimated = estimate_payload_tokens(payload)
-        if dropped_fields:
-            metadata["_truncated_fields"] = dropped_fields
-            clipped = True
-            metadata_clipped = True
-            estimated = estimate_payload_tokens(payload)
-    if metadata_clipped:
-        payload["metadata_clipped"] = True
-    return clipped
+            if estimated <= cap_tokens:
+                break
+        if not elided:
+            break
+    # Last resort: when even the marker forms overshoot, drop the biggest
+    # remaining values entirely and leave a count so the model knows.
+    dropped_fields = 0
+    while estimated > cap_tokens and metadata:
+        key = max(
+            metadata,
+            key=lambda k: len(k) + len(json.dumps(metadata[k], default=str)),
+        )
+        if len(key) + len(json.dumps(metadata[key], default=str)) < 24:
+            break
+        del metadata[key]
+        dropped_fields += 1
+        estimated = estimate_payload_tokens(payload)
+    if dropped_fields:
+        metadata["_truncated_fields"] = dropped_fields
+        changed = True
+    return changed
 
 
 def _clip_grep_match_windows(

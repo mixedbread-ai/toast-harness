@@ -13,7 +13,7 @@ import json
 import os
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from threading import RLock
 from typing import Any
@@ -276,68 +276,27 @@ async def inspect_metadata(
     )
     stores_client = resolved_client.stores
 
-    async def fetch_facets() -> Any:
-        started = time.perf_counter()
-        try:
-            return await stores_client.metadata_facets(request)
-        finally:
-            emit_bridge_timing(
-                "metadata_provider_call",
-                operation="metadata_facets",
-                duration_ms=round((time.perf_counter() - started) * 1000, 3),
-            )
-
-    async def sample_value_types() -> dict[str, set[str]]:
-        started = time.perf_counter()
-        try:
-            return await _sampled_metadata_value_types(
-                store_identifiers=store_ids,
-                client=resolved_client,
-                api_key=api_key,
-                api_key_env=api_key_env,
-            )
-        finally:
-            emit_bridge_timing(
-                "metadata_provider_call",
-                operation="list_chunks_type_sample",
-                duration_ms=round((time.perf_counter() - started) * 1000, 3),
-            )
-
     # Facet aggregation and type sampling are independent remote operations,
     # overlapped here while their merge below stays deterministic.
     # return_exceptions keeps both joined before either failure propagates
     # (facets first) instead of leaving the sibling running detached.
     facets_response, value_types = await asyncio.gather(
-        fetch_facets(), sample_value_types(), return_exceptions=True
+        _timed_metadata_provider_call(
+            "metadata_facets", lambda: stores_client.metadata_facets(request)
+        ),
+        _timed_metadata_provider_call(
+            "list_chunks_type_sample",
+            lambda: _sampled_metadata_value_types(
+                store_identifiers=store_ids,
+                client=resolved_client,
+                api_key=api_key,
+                api_key_env=api_key_env,
+            ),
+        ),
+        return_exceptions=True,
     )
-    for outcome in (facets_response, value_types):
-        if isinstance(outcome, BaseException) and not isinstance(outcome, Exception):
-            raise outcome
-    if isinstance(facets_response, Exception):
-        raise facets_response
-    if isinstance(value_types, Exception):
-        raise value_types
-    raw = _model_to_json_dict(facets_response)
-    if "facets" in raw:
-        facet_data = raw["facets"]
-    elif "data" in raw:
-        facet_data = raw["data"]
-    else:
-        facet_data = raw
-
-    fields: dict[str, Any] = {}
-    if isinstance(facet_data, Mapping):
-        for key, values in facet_data.items():
-            fields[str(key)] = _compact_facet_values(values, max_values=max_values)
-    elif isinstance(facet_data, list):
-        for item in facet_data:
-            if not isinstance(item, Mapping):
-                continue
-            key = item.get("key") or item.get("field") or item.get("name")
-            if not key:
-                continue
-            values = item.get("values") or item.get("facets") or item
-            fields[str(key)] = _compact_facet_values(values, max_values=max_values)
+    _raise_gathered_failure(facets_response, value_types)
+    fields = _facet_fields_from_response(facets_response, max_values=max_values)
 
     fields = {
         field_name: _typed_facet_samples(values, value_types.get(field_name))
@@ -375,6 +334,58 @@ def _rankable_metadata_fields(
         if (value_types.get(field_name, set()) - {"null"}) == {"number"}
     ]
     return sorted(rankable)
+
+
+async def _timed_metadata_provider_call[ResultT](
+    operation: str,
+    call: Callable[[], Awaitable[ResultT]],
+) -> ResultT:
+    """Run one provider call with its duration on the bridge-timing stream."""
+    started = time.perf_counter()
+    try:
+        return await call()
+    finally:
+        emit_bridge_timing(
+            "metadata_provider_call",
+            operation=operation,
+            duration_ms=round((time.perf_counter() - started) * 1000, 3),
+        )
+
+
+def _raise_gathered_failure(*outcomes: Any) -> None:
+    """Re-raise a gathered failure: cancellations and exits first, then in argument order."""
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException) and not isinstance(outcome, Exception):
+            raise outcome
+    for outcome in outcomes:
+        if isinstance(outcome, Exception):
+            raise outcome
+
+
+def _facet_fields_from_response(facets_response: Any, *, max_values: int) -> dict[str, Any]:
+    """Normalize the provider's facet payload shapes into field-to-values."""
+    raw = _model_to_json_dict(facets_response)
+    if "facets" in raw:
+        facet_data = raw["facets"]
+    elif "data" in raw:
+        facet_data = raw["data"]
+    else:
+        facet_data = raw
+
+    fields: dict[str, Any] = {}
+    if isinstance(facet_data, Mapping):
+        for key, values in facet_data.items():
+            fields[str(key)] = _compact_facet_values(values, max_values=max_values)
+    elif isinstance(facet_data, list):
+        for item in facet_data:
+            if not isinstance(item, Mapping):
+                continue
+            key = item.get("key") or item.get("field") or item.get("name")
+            if not key:
+                continue
+            values = item.get("values") or item.get("facets") or item
+            fields[str(key)] = _compact_facet_values(values, max_values=max_values)
+    return fields
 
 
 async def filter_metadata(
@@ -565,53 +576,24 @@ async def filter_chunks(
     result_k = min(max(int(k or FILTER_CHUNKS_DEFAULT_K), 1), FILTER_CHUNKS_MAX_K)
     sort_direction = "asc" if str(direction or "desc").lower() == "asc" else "desc"
 
-    sort_by = [rank_by, sort_direction == "asc"] if rank_by else None
-    try:
-        chunks = await list_chunks_raw(
-            store_identifiers=store_ids,
-            top_k=result_k,
-            metadata_filter=filters,
-            sort_by=sort_by,
-            client=client,
-            api_key=api_key,
-            api_key_env=api_key_env,
-        )
-    except UnprocessableEntityError:
-        if sort_by is None:
-            raise
-        # Stores whose metadata index types numeric fields as strings reject
-        # server-side sorts; fetch unsorted and rank client-side below.
-        chunks = await list_chunks_raw(
-            store_identifiers=store_ids,
-            top_k=max(result_k, int(file_scan_limit)),
-            metadata_filter=filters,
-            sort_by=None,
-            client=client,
-            api_key=api_key,
-            api_key_env=api_key_env,
-        )
+    chunks = await _list_chunks_with_sort_fallback(
+        store_ids=store_ids,
+        result_k=result_k,
+        file_scan_limit=int(file_scan_limit),
+        filters=filters,
+        sort_by=[rank_by, sort_direction == "asc"] if rank_by else None,
+        client=client,
+        api_key=api_key,
+        api_key_env=api_key_env,
+    )
 
     if rank_by:
-        sortable_chunks: list[tuple[float, dict[str, Any]]] = []
-        unrankable_chunks: list[dict[str, Any]] = []
-        for chunk in chunks:
-            value = metadata_lookup(chunk, rank_by)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                unrankable_chunks.append(dict(chunk))
-                continue
-            sortable_chunks.append((float(value), dict(chunk)))
-        # rank_by is an ordering hint, not a filter: chunks with no numeric value keep the
-        # no-rank_by deterministic order behind the ranked ones instead of being dropped.
-        chunks = [
-            chunk
-            for _, chunk in sorted(
-                sortable_chunks,
-                key=lambda item: item[0],
-                reverse=sort_direction == "desc",
-            )
-        ] + _deterministic_chunk_order(unrankable_chunks)
-        rank_by_applied = bool(sortable_chunks)
-        non_numeric_count = len(unrankable_chunks)
+        ranking = _rank_chunks_by_metadata(
+            chunks, rank_by=rank_by, descending=sort_direction == "desc"
+        )
+        chunks = ranking.chunks
+        rank_by_applied = ranking.applied
+        non_numeric_count = ranking.non_numeric_count
     else:
         chunks = _deterministic_chunk_order(chunks)
         rank_by_applied = None
@@ -632,6 +614,80 @@ async def filter_chunks(
             "candidate_count": len(chunks),
             "results": results,
         }
+    )
+
+
+async def _list_chunks_with_sort_fallback(
+    *,
+    store_ids: Sequence[str],
+    result_k: int,
+    file_scan_limit: int,
+    filters: Mapping[str, Any] | None,
+    sort_by: list[Any] | None,
+    client: AsyncRetrievalClient | None,
+    api_key: str | None,
+    api_key_env: str | None,
+) -> list[dict[str, Any]]:
+    try:
+        return await list_chunks_raw(
+            store_identifiers=store_ids,
+            top_k=result_k,
+            metadata_filter=filters,
+            sort_by=sort_by,
+            client=client,
+            api_key=api_key,
+            api_key_env=api_key_env,
+        )
+    except UnprocessableEntityError:
+        if sort_by is None:
+            raise
+        # Stores whose metadata index types numeric fields as strings reject
+        # server-side sorts; fetch unsorted and rank client-side instead.
+        return await list_chunks_raw(
+            store_identifiers=store_ids,
+            top_k=max(result_k, file_scan_limit),
+            metadata_filter=filters,
+            sort_by=None,
+            client=client,
+            api_key=api_key,
+            api_key_env=api_key_env,
+        )
+
+
+@dataclass(slots=True)
+class _RankedByMetadata:
+    chunks: list[dict[str, Any]]
+    applied: bool
+    non_numeric_count: int
+
+
+def _rank_chunks_by_metadata(
+    chunks: Sequence[Mapping[str, Any]],
+    *,
+    rank_by: str,
+    descending: bool,
+) -> _RankedByMetadata:
+    """Order the chunks client-side by a numeric metadata field.
+
+    rank_by is an ordering hint, not a filter: chunks with no numeric value keep
+    the no-rank_by deterministic order behind the ranked ones instead of being
+    dropped.
+    """
+    sortable_chunks: list[tuple[float, dict[str, Any]]] = []
+    unrankable_chunks: list[dict[str, Any]] = []
+    for chunk in chunks:
+        value = metadata_lookup(chunk, rank_by)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            unrankable_chunks.append(dict(chunk))
+            continue
+        sortable_chunks.append((float(value), dict(chunk)))
+    ranked = [
+        chunk for _, chunk in sorted(sortable_chunks, key=lambda item: item[0], reverse=descending)
+    ] + _deterministic_chunk_order(unrankable_chunks)
+    return _RankedByMetadata(
+        chunks=ranked,
+        applied=bool(sortable_chunks),
+        non_numeric_count=len(unrankable_chunks),
     )
 
 
@@ -1340,6 +1396,7 @@ def submit_ranking(
     chunks: Sequence[Mapping[str, Any]],
     *,
     ranking_strategy: str | None = None,
+    answer: str | None = None,
 ) -> dict[str, Any]:
     """Normalize ``submit_ranking`` output into the final ranked-chunk payload."""
     result: dict[str, Any] = {
@@ -1347,6 +1404,8 @@ def submit_ranking(
     }
     if ranking_strategy is not None:
         result["ranking_strategy"] = ranking_strategy.strip()
+    if answer is not None:
+        result["answer"] = answer.strip()
     return result
 
 

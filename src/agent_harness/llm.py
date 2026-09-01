@@ -3,7 +3,8 @@
 The harness never bundles a model provider. ``GenerationFn`` is the seam: the
 caller passes a callable that produces the next assistant message, and the
 harness owns everything around it -- response and tool-call normalization, the
-Responses API trace, and parsing of the terminal ``submit_ranking`` call.
+Responses API trace, and parsing of the terminal ``submit_ranking`` call (or,
+under answer_mode="plain_text", the terminal prose turn).
 Callers that talk to a Responses API endpoint can normalize with
 ``response_to_chat_completion``; callers that talk chat-completions already
 return the shape the loop reads.
@@ -26,16 +27,17 @@ import logging
 import os
 from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Protocol, runtime_checkable
 
 from .config import (
     AGENTIC_FINAL_SUBMIT_MAX_INVALID_RETRIES,
+    FINAL_ANSWER_CORRECTION_MESSAGE,
     FINAL_SUBMIT_CORRECTION_MESSAGE,
     current_tuning,
 )
-from .schemas import RankedChunkList
+from .schemas import AnsweredRankedChunkList, RankedChunkList
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +100,7 @@ class SyncGenerationAdapter:
             self.generation_fn,
             messages,
             tools=tools,
-            completion_config=completion_config,
+            completion_config=dict(completion_config),
             force_submit=force_submit,
             forced_tool_name=forced_tool_name,
         )
@@ -146,10 +148,18 @@ class TokenUsage:
 
 @dataclass(frozen=True, slots=True)
 class ForcedSubmission[SubmissionT]:
-    """Outcome of a forced final-tool turn: the parsed submission and its cost."""
+    """Outcome of a forced final turn: the parsed submission and the cost of every attempt.
+
+    ``max_input_tokens`` and ``final_input_tokens`` are provider counts, zero
+    when the provider reported none; the rollout prefers them over its own
+    estimate of the forced prompt.
+    """
 
     submission: SubmissionT | None
     usage: TokenUsage
+    reasoning_tokens: int = 0
+    max_input_tokens: int = 0
+    final_input_tokens: int = 0
 
 
 def require_generation_fn[GenerationT](
@@ -566,10 +576,18 @@ def failed_generation_response(
     )
 
 
-def parse_ranking(arguments: str) -> RankedChunkList:
-    ranking = RankedChunkList.model_validate_json(arguments)
+def parse_ranking(arguments: str, *, require_answer: bool = False) -> RankedChunkList:
+    """Parse a ``submit_ranking`` payload.
+
+    ``require_answer`` (answer_mode="submit_ranking") parses the model that
+    carries the ``answer`` field and rejects a payload that omits it.
+    """
+    ranking_model = AnsweredRankedChunkList if require_answer else RankedChunkList
+    ranking = ranking_model.model_validate_json(arguments)
     if not ranking.ranking_strategy:
         raise ValueError("submit_ranking missing ranking_strategy")
+    if require_answer and not ranking.answer:
+        raise ValueError("submit_ranking missing answer")
     return ranking
 
 
@@ -579,6 +597,7 @@ async def force_ranking(
     tools: list[dict[str, Any]],
     completion_config: dict[str, Any],
     validate: Callable[[RankedChunkList], None] | None = None,
+    require_answer: bool = False,
     responses_trace: list[dict[str, Any]] | None = None,
     response_trace_metadata: Mapping[str, Any] | None = None,
     generation_fn: AsyncGenerationFn,
@@ -591,56 +610,184 @@ async def force_ranking(
     failure on their tool trace. The terminal failure (retries exhausted) is not
     reported here -- callers already trace that as the forced call's own outcome.
     """
-    usage = TokenUsage()
+    return await _retry_forced_turn(
+        messages,
+        tools=tools,
+        completion_config=completion_config,
+        trace_phase="force_submit",
+        forcing={"force_submit": True, "forced_tool_name": "submit_ranking"},
+        submission_label="ranking",
+        parse_response=lambda response: _parse_forced_submission(
+            response,
+            expected_tool_name="submit_ranking",
+            parse_arguments=lambda arguments: parse_ranking(
+                arguments, require_answer=require_answer
+            ),
+            validate=validate,
+        ),
+        correction_message=_final_submit_correction_message,
+        responses_trace=responses_trace,
+        response_trace_metadata=response_trace_metadata,
+        generation_fn=generation_fn,
+        on_invalid_attempt=on_invalid_attempt,
+    )
+
+
+async def force_answer(
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]],
+    completion_config: dict[str, Any],
+    responses_trace: list[dict[str, Any]] | None = None,
+    response_trace_metadata: Mapping[str, Any] | None = None,
+    generation_fn: AsyncGenerationFn,
+    on_invalid_attempt: Callable[[int, str], None] | None = None,
+) -> ForcedSubmission[str]:
+    """Force a plain-text final answer, retrying on tool-call or empty turns.
+
+    The answer_mode="plain_text" counterpart of ``force_ranking``: there is no
+    tool to force, so the turn is an ordinary generation whose response must
+    carry text content and no tool calls. See ``force_ranking`` for the
+    ``on_invalid_attempt`` contract.
+    """
+    return await _retry_forced_turn(
+        messages,
+        tools=tools,
+        completion_config=completion_config,
+        trace_phase="force_answer",
+        forcing={},
+        submission_label="answer",
+        parse_response=_parse_forced_answer_response,
+        correction_message=_final_answer_correction_message,
+        responses_trace=responses_trace,
+        response_trace_metadata=response_trace_metadata,
+        generation_fn=generation_fn,
+        on_invalid_attempt=on_invalid_attempt,
+    )
+
+
+@dataclass(slots=True)
+class _ForcedTurnLedger:
+    """The cost of every attempt of one forced tail, in ``ForcedSubmission`` terms."""
+
+    usage: TokenUsage = field(default_factory=TokenUsage)
+    reasoning_tokens: int = 0
+    max_input_tokens: int = 0
+    final_input_tokens: int = 0
+
+    def record(self, response: Any) -> None:
+        turn = TokenUsage.of_response(response)
+        self.usage = self.usage + turn
+        self.reasoning_tokens += completion_reasoning_tokens(response)
+        self.max_input_tokens = max(self.max_input_tokens, turn.input_tokens)
+        self.final_input_tokens = turn.input_tokens
+
+    def close[SubmissionT](self, submission: SubmissionT | None) -> ForcedSubmission[SubmissionT]:
+        return ForcedSubmission(
+            submission,
+            self.usage,
+            reasoning_tokens=self.reasoning_tokens,
+            max_input_tokens=self.max_input_tokens,
+            final_input_tokens=self.final_input_tokens,
+        )
+
+
+async def _retry_forced_turn[SubmissionT](
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]],
+    completion_config: dict[str, Any],
+    trace_phase: str,
+    forcing: Mapping[str, Any],
+    submission_label: str,
+    parse_response: Callable[[Any], tuple[SubmissionT | None, str | None]],
+    correction_message: Callable[[str], dict[str, str]],
+    responses_trace: list[dict[str, Any]] | None,
+    response_trace_metadata: Mapping[str, Any] | None,
+    generation_fn: AsyncGenerationFn,
+    on_invalid_attempt: Callable[[int, str], None] | None,
+) -> ForcedSubmission[SubmissionT]:
+    """Retry the episode's last turn until ``parse_response`` accepts it.
+
+    The two forced tails differ on three axes and share everything else, so
+    those three are the parameters: ``forcing`` carries the generation kwargs
+    that pin the turn to a tool call and is empty when the final turn is prose,
+    ``trace_phase`` labels it, and ``parse_response`` decides what a valid
+    submission looks like. Rejected turns are closed out the same way either
+    way -- ``append_tool_error_messages`` is a no-op on a response that carried
+    no tool calls, and answers the stray ones when a prose turn wrongly did.
+
+    Every attempt gets its own copy of ``completion_config``: a generation seam
+    that applies ``apply_force_submit`` in place must not leak the forced
+    policy into later turns.
+    """
+    ledger = _ForcedTurnLedger()
     for attempt in range(AGENTIC_FINAL_SUBMIT_MAX_INVALID_RETRIES + 1):
         response = await generation_fn(
             messages,
             tools=tools,
-            completion_config=completion_config,
-            force_submit=True,
-            forced_tool_name="submit_ranking",
+            completion_config=dict(completion_config),
+            **forcing,
         )
         if responses_trace is not None:
             extend_responses_api_trace(
                 responses_trace,
                 response,
-                phase="force_submit",
-                force_submit=True,
-                forced_tool_name="submit_ranking",
+                phase=trace_phase,
+                **forcing,
                 attempt=attempt + 1,
                 **dict(response_trace_metadata or {}),
             )
-        usage = usage + TokenUsage.of_response(response)
+        ledger.record(response)
 
-        ranking, validation_error = _parse_forced_ranking_response(response, validate)
+        submission, validation_error = parse_response(response)
         if validation_error is None:
-            return ForcedSubmission(ranking, usage)
+            return ledger.close(submission)
 
-        logger.warning("Invalid forced submit_ranking submission: %s", validation_error)
+        logger.warning("Invalid forced %s: %s", submission_label, validation_error)
         append_response_message(messages, response)
         if attempt < AGENTIC_FINAL_SUBMIT_MAX_INVALID_RETRIES:
             append_tool_error_messages(messages, response, validation_error)
-            messages.append(_final_submit_correction_message(validation_error))
+            messages.append(correction_message(validation_error))
             if on_invalid_attempt is not None:
                 on_invalid_attempt(attempt + 1, validation_error)
 
-    return ForcedSubmission(None, usage)
+    return ledger.close(None)
 
 
-def _parse_forced_ranking_response(
+def _parse_forced_submission[SubmissionT](
     response: Any | None,
-    validate: Callable[[RankedChunkList], None] | None,
-) -> tuple[RankedChunkList | None, str | None]:
-    tool_call, validation_error = _single_tool_call(response, "submit_ranking")
+    *,
+    expected_tool_name: str,
+    parse_arguments: Callable[[str], SubmissionT],
+    validate: Callable[[SubmissionT], None] | None,
+) -> tuple[SubmissionT | None, str | None]:
+    """Parse a forced tool turn: exactly one call to the expected tool, valid."""
+    tool_call, validation_error = _single_tool_call(response, expected_tool_name)
     if validation_error is not None or tool_call is None:
-        return None, validation_error or "submit_ranking tool call missing"
+        return None, validation_error or f"{expected_tool_name} tool call missing"
     try:
-        ranking = parse_ranking(tool_call.function.arguments)
+        submission = parse_arguments(tool_call.function.arguments)
         if validate is not None:
-            validate(ranking)
-        return ranking, None
+            validate(submission)
+        return submission, None
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         return None, str(exc)
+
+
+def _parse_forced_answer_response(response: Any | None) -> tuple[str | None, str | None]:
+    """Parse a forced prose turn: text content, and no tool calls."""
+    choices = list(getattr(response, "choices", None) or [])
+    message = getattr(choices[0], "message", None) if choices else None
+    if message is None:
+        return None, "final answer missing"
+    if response_tool_calls(message):
+        return None, "tool calls are not allowed on the final answer turn"
+    content = getattr(message, "content", None)
+    answer = content.strip() if isinstance(content, str) else ""
+    if not answer:
+        return None, "final answer text missing"
+    return answer, None
 
 
 def _single_tool_call(
@@ -664,6 +811,13 @@ def _final_submit_correction_message(error: str) -> dict[str, str]:
     return {
         "role": "user",
         "content": FINAL_SUBMIT_CORRECTION_MESSAGE.format(error=_compact_error(error)),
+    }
+
+
+def _final_answer_correction_message(error: str) -> dict[str, str]:
+    return {
+        "role": "user",
+        "content": FINAL_ANSWER_CORRECTION_MESSAGE.format(error=_compact_error(error)),
     }
 
 

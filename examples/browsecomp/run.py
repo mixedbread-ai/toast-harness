@@ -32,6 +32,9 @@ TOP_P = float(os.environ.get("TOAST_TOP_P", "0.95"))
 SAMPLING_TOP_K = int(os.environ.get("TOAST_SAMPLING_TOP_K", "0"))
 TOP_K = 10
 SEED = 0
+# How the episode ends: "none" (ranking only), "submit_ranking" (ranking plus a
+# required answer), or "plain_text" (answer only; the harness then takes no top_k).
+ANSWER_MODE = os.environ.get("TOAST_ANSWER_MODE", "none")
 
 # The harness completion_config carries harness-side policy keys (model,
 # require_tool_calls, num_retries, reasoning_effort) that are not wire params.
@@ -117,9 +120,10 @@ def main() -> int:
             result = agent_harness.run_searcher(
                 item["query"],
                 store_identifiers=[STORE],
-                top_k=TOP_K,
+                top_k=None if ANSWER_MODE == "plain_text" else TOP_K,
                 generation_fn=build_generation_fn(client, calls),
                 query_id=query_id,
+                answer_mode=ANSWER_MODE,
             )
         except Exception as exc:  # recorded per query, never swallowed
             error = traceback.format_exc()
@@ -139,6 +143,7 @@ def main() -> int:
                 "wall_s": wall_s,
                 "ranked_ids": list(retrieval.get("ranked_ids") or []),
                 "ranking_strategy": retrieval.get("ranking_strategy"),
+                "answer": retrieval.get("answer"),
                 "rounds_executed": agent.get("rounds_executed"),
                 "forced_ranking": agent.get("forced_ranking"),
                 "total_tokens": agent.get("total_tokens"),

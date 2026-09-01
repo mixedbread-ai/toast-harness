@@ -17,21 +17,35 @@ from .config import (
     searcher_max_rounds,
 )
 from .prompts import initial_metadata_facets_message
+from .schemas import AnswerMode, validate_answer_mode
 
 
 def build_fast_searcher_task_description(
     *,
     top_k: int | None = None,
     strict_top_k: bool = False,
+    answer_mode: AnswerMode = "none",
 ) -> str:
+    validate_answer_mode(answer_mode)
+    if answer_mode == "plain_text":
+        # No ranking exists in this mode, so top_k has nothing to shape.
+        return (
+            "Given a user query and a set of search tools, search the corpus and "
+            "answer the query in plain text from the retrieved evidence."
+        )
+    answer_clause = (
+        " and answer the query from the retrieved evidence"
+        if answer_mode == "submit_ranking"
+        else ""
+    )
     if strict_top_k and top_k is not None:
         return (
             f"Given a user query and a set of search tools, report exactly {top_k} "
-            "document chunks ordered by relevance."
+            f"document chunks ordered by relevance{answer_clause}."
         )
     return (
         "Given a user query and a set of search tools, report the document chunks "
-        "relevant to the query ordered by relevance."
+        f"relevant to the query ordered by relevance{answer_clause}."
     )
 
 
@@ -40,26 +54,46 @@ def build_searcher_system_prompt(
     task_description: str,
     top_k: int | None = None,
     strict_top_k: bool = False,
+    answer_mode: AnswerMode = "none",
 ) -> str:
+    """The system prompt; every sentence that names how the episode ends
+    branches on ``answer_mode``, and collapses to the original text under
+    ``"none"``."""
+    validate_answer_mode(answer_mode)
+    plain_answer = answer_mode == "plain_text"
     context_metadata_source = (
         "- INITIAL_METADATA_FACETS is the source of truth for valid filter keys, value formats,\n"
         "  rank fields, and representative sample values. Samples are incomplete and are not\n"
         "  exhaustive enums, especially for high-cardinality identifier fields such as invoice_id.\n"
         "  Result metadata may confirm more fields or values. Do not invent metadata."
     )
+    first_turn_finish = (
+        "reply with your final answer immediately"
+        if plain_answer
+        else "call submit_ranking immediately"
+    )
     first_turn_guidance = (
-        "- If INITIAL_SEARCH_RESULTS already answer the query, call submit_ranking immediately.\n"
+        f"- If INITIAL_SEARCH_RESULTS already answer the query, {first_turn_finish}.\n"
         "- Otherwise, choose matching tools: overview_search for orientation, search_corpus for\n"
         "  semantic meaning, grep for exact tokens, filter_chunks for metadata."
     )
-    handle_guidance = "submit_ranking"
+    handle_targets = "later tool calls" if plain_answer else "later tool calls and submit_ranking"
     metadata_confirmation_source = "facets or result metadata"
     prune_subject = "user query"
     final_rules = _final_tool_rules(
         top_k=top_k,
         strict_top_k=strict_top_k,
+        answer_mode=answer_mode,
     )
     max_rounds = searcher_max_rounds()
+    final_turn_label = "answer" if plain_answer else "submit_ranking"
+    end_episode_action = (
+        "reply with your final answer in\n  plain text, with no tool calls,"
+        if plain_answer
+        else "call\n  submit_ranking in its own turn"
+    )
+    told_to = "answer" if plain_answer else "submit"
+    prune_done_action = "reply with your final answer" if plain_answer else "call submit_ranking"
 
     return f"""You are a specialized search agent in a document retrieval pipeline.
 
@@ -72,7 +106,7 @@ the rules below.
 CONTEXT:
 {context_metadata_source}
 - Search results expose short handles: chunk_id identifies an exact chunk, document_id identifies
-  a document. Use these handles in later tool calls and {handle_guidance}.
+  a document. Use these handles in {handle_targets}.
 - Use the runtime UTC date for relative date/recency requests unless the user gives another
   timezone. Prefer half-open timestamp ranges and only use date-only strings when facets/results
   show that format; check likely fields such as active_from, active_to, created_at, launch_date,
@@ -89,12 +123,11 @@ WORKFLOW:
   document and pruning tools.
 - Follow-up searches should pivot to new evidence gaps, not shallow paraphrases. Use get_chunks
   for exact already-seen chunks and read_document when nearby context around a chunk matters.
-- You have at most {max_rounds} rounds (the final submit_ranking turn is one of them); from the second round on, a
+- You have at most {max_rounds} rounds (the final {final_turn_label} turn is one of them); from the second round on, a
   "Search round N of max {max_rounds}." line marks which round the tool results above
-  came from. It is a ceiling, not a quota. End the episode yourself: call
-  submit_ranking in its own turn as soon as the evidence you have supports it, at latest in
+  came from. It is a ceiling, not a quota. End the episode yourself: {end_episode_action} as soon as the evidence you have supports it, at latest in
   your final round. Extra rounds are not free; do not search on after the evidence is sufficient,
-  and never wait to be told to submit.
+  and never wait to be told to {told_to}.
 
 RETRIEVAL:
 - overview_search is summary-only orientation; use summary to identify promising themes,
@@ -126,7 +159,7 @@ Context management:
 - Call prune_context to remove chunk content irrelevant to your {prune_subject}. Keep the context
   window small; you have a limited token budget.
 - Once you receive a context budget notice, include prune_context among your tool calls that round
-  to drop content you no longer need, or call submit_ranking if you are done. prune_context may
+  to drop content you no longer need, or {prune_done_action} if you are done. prune_context may
   run in parallel with searches in the same turn, so a budget notice never has to cost a search --
   you do not need a prune-only turn. prune_context counts toward the {MAX_PARALLEL_TOOL_CALLS} call
   limit; do not exceed that limit.
@@ -148,7 +181,11 @@ def _final_tool_rules(
     *,
     top_k: int | None = None,
     strict_top_k: bool = False,
+    answer_mode: AnswerMode = "none",
 ) -> str:
+    if answer_mode == "plain_text":
+        return _plain_answer_rules()
+    with_answer = answer_mode == "submit_ranking"
     if strict_top_k and top_k is not None:
         count_rule = (
             f"- submit_ranking.chunks must contain exactly {top_k} chunks ranked most-relevant first;\n"
@@ -157,27 +194,57 @@ def _final_tool_rules(
             "  next-best retrieved chunks."
         )
         submit_rule = (
-            f"- Call submit_ranking with exactly {top_k} chunks when you have enough evidence."
+            f"- Call submit_ranking with exactly {top_k} chunks and your answer when you have "
+            "enough evidence."
+            if with_answer
+            else f"- Call submit_ranking with exactly {top_k} chunks when you have enough evidence."
         )
     else:
         count_rule = (
             "- submit_ranking.chunks must include all chunks relevant to the user query; rank most-relevant first;\n"
             "  relevance_score in [0, 1]. Use an empty chunk list only if no relevant chunks exist."
         )
-        submit_rule = "- Call submit_ranking when you have enough evidence."
+        submit_rule = (
+            "- Call submit_ranking with your answer when you have enough evidence."
+            if with_answer
+            else "- Call submit_ranking when you have enough evidence."
+        )
+    answer_rule = (
+        "\n- submit_ranking.answer must give your final answer to the user query, based only on\n"
+        "  retrieved evidence; if the evidence is insufficient to answer, say so."
+        if with_answer
+        else ""
+    )
     return f"""RANKING:
 - Before submit_ranking, compare the retrieved chunks with each other. Rank for the user's intent,
   not just search_score.
 - For metric/order requests, compare the relevant metadata field or value stated in content and
   order by the requested direction. Example: "highest budget campaigns" ranks by budget descending.
 {count_rule}
-- ranking_strategy must state the interpretation, constraints, comparison basis, and final ordering rule.
+- ranking_strategy must state the interpretation, constraints, comparison basis, and final ordering rule.{answer_rule}
 - Use only chunk_id values that appeared in your tool results. Do not duplicate chunk_id values.
 
 OUTPUT RULES:
 - USE TOOLS ONLY. Never generate a plain text response.
 {submit_rule}
 - submit_ranking must be the only tool call in its turn.
+- For audio/video chunks, trust the search score as the relevance signal (the full media is not available to you)."""
+
+
+def _plain_answer_rules() -> str:
+    """The RANKING/OUTPUT block's counterpart when the episode ends on prose."""
+    return """ANSWER:
+- Before answering, compare the retrieved chunks with each other and weigh the evidence for the
+  user's intent, not just search_score.
+- For metric/order requests, compare the relevant metadata field or value stated in content and
+  order by the requested direction. Example: "highest budget campaigns" compares budget descending.
+- Base the answer only on retrieved evidence. If the evidence is insufficient to answer, say so.
+
+OUTPUT RULES:
+- To finish, reply with your final answer to the user query as a plain-text message with NO tool
+  calls; a plain-text reply without tool calls ends the episode.
+- Until you answer, every response must contain tool calls.
+- Do not report chunk lists, chunk_id values, or rankings; deliver the answer itself.
 - For audio/video chunks, trust the search score as the relevance signal (the full media is not available to you)."""
 
 
@@ -190,14 +257,18 @@ def fast_searcher_messages(
     strict_top_k: bool = False,
     additional_instructions: str | None = None,
     as_of: date | None = None,
+    answer_mode: AnswerMode = "none",
 ) -> list[dict[str, Any]]:
     prompt = build_searcher_system_prompt(
         task_description=_with_additional_instructions(
-            build_fast_searcher_task_description(top_k=top_k, strict_top_k=strict_top_k),
+            build_fast_searcher_task_description(
+                top_k=top_k, strict_top_k=strict_top_k, answer_mode=answer_mode
+            ),
             additional_instructions,
         ),
         top_k=top_k,
         strict_top_k=strict_top_k,
+        answer_mode=answer_mode,
     )
     messages = [
         {"role": "system", "content": prompt + _runtime_context(as_of)},

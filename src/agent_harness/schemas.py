@@ -19,6 +19,21 @@ MetadataFilterValue = str | int | float | bool | None | list[str | int | float |
 MetadataHintSource = Literal["inspect_metadata", "result_metadata"]
 MetadataHintUsage = Literal["soft_hint", "hard_filter"]
 
+# How the fast searcher delivers an answer, if at all:
+# - "none": submit_ranking with no answer (the default protocol).
+# - "submit_ranking": submit_ranking carries a required ``answer`` argument.
+# - "plain_text": no submit_ranking; the episode ends on a plain-text answer
+#   turn with no tool calls.
+AnswerMode = Literal["none", "submit_ranking", "plain_text"]
+ANSWER_MODES: tuple[AnswerMode, ...] = ("none", "submit_ranking", "plain_text")
+
+
+def validate_answer_mode(answer_mode: str) -> AnswerMode:
+    if answer_mode not in ANSWER_MODES:
+        raise ValueError(f"unknown answer_mode {answer_mode!r}; expected one of {ANSWER_MODES}")
+    return answer_mode  # type: ignore[return-value]
+
+
 FILTER_OPERATORS = (
     "eq",
     "not_eq",
@@ -95,6 +110,24 @@ class RankedChunkList(BaseModel):
     @classmethod
     def dedupe_duplicate_chunks(cls, chunks: list[RankedChunk]) -> list[RankedChunk]:
         return _dedupe_ranked_chunks(chunks)
+
+
+class AnsweredRankedChunkList(RankedChunkList):
+    """A ``submit_ranking`` payload that also carries the agent's answer.
+
+    The model behind answer_mode="submit_ranking"; whether an omitted answer is
+    an error is decided by ``llm.parse_ranking``, not here.
+    """
+
+    answer: str | None = None
+
+    @field_validator("answer")
+    @classmethod
+    def strip_answer(cls, answer: str | None) -> str | None:
+        if answer is None:
+            return None
+        answer = answer.strip()
+        return answer or None
 
 
 class MetadataFilter(BaseModel):

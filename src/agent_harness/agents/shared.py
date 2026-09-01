@@ -40,7 +40,7 @@ def over_budget_round_missing_prune(
     over_budget: bool,
     tool_calls: Sequence[Any],
     *,
-    final_tool_name: str,
+    final_tool_name: str | None,
 ) -> bool:
     """Whether an over-budget round failed to prune without finishing.
 
@@ -48,14 +48,16 @@ def over_budget_round_missing_prune(
     include ``prune_context`` (in parallel with any other tools). A round that
     ignores that -- neither pruning nor submitting the final ``final_tool_name``
     -- is recorded on the iteration summary for observability, without an
-    error being surfaced back to the model.
+    error being surfaced back to the model. ``final_tool_name=None`` means the
+    episode ends on a prose turn, which no tool call can be.
     """
     if not over_budget:
         return False
     names = {
         str(getattr(getattr(tool_call, "function", None), "name", "")) for tool_call in tool_calls
     }
-    return "prune_context" not in names and final_tool_name not in names
+    finished = final_tool_name is not None and final_tool_name in names
+    return "prune_context" not in names and not finished
 
 
 def agent_caused_payload_error(payload: Any) -> str | None:

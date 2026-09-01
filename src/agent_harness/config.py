@@ -370,6 +370,11 @@ FINAL_SUBMIT_CORRECTION_MESSAGE = (
     "Call submit_ranking again with only valid schema fields and valid chunk_id handles."
 )
 
+FINAL_ANSWER_CORRECTION_MESSAGE = (
+    "Your previous response was invalid: {error}. "
+    "Reply now with your final answer to the user query as plain text. Do not call any tools."
+)
+
 SEARCHER_AGENT_CONFIG: dict[str, Any] = {
     "model": "gpt-5.5",
     "reasoning_effort": "high",
