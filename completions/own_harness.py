@@ -6,6 +6,13 @@ text once the evidence is sufficient:
 
     python own_harness.py [--corpus DIR] [--out FILE] "question"
 
+The loop continues one stored completion instead of resending the history:
+every request after the first names the previous completion as
+``previous_completion_id`` and sends only the new tool results. That keeps the
+conversation on the server, where ``context_management`` lets the model prune
+tool results it no longer needs, including the ones your own tools produced;
+each response reports what was cleared as ``context_management.applied_edits``.
+
 ``openai`` is the only dependency; ``MXBAI_API_KEY`` comes from the environment,
 a ``.env`` file or ``--api-key``. The sample corpus is thirteen documents about
 a fictional sensor maker, so every answer has to come from retrieval. To connect
@@ -30,7 +37,8 @@ from typing import Annotated, Any, Literal, get_args, get_origin, get_type_hints
 
 MODEL = "toast-1"
 BASE_URL = os.environ.get("MXBAI_COMPLETIONS_BASE_URL", "https://api.mixedbread.com/v1")
-SAMPLING = {"temperature": 0.7, "top_p": 0.95, "store": False}
+SAMPLING = {"temperature": 0.7, "top_p": 0.95}
+CONTEXT_MANAGEMENT = {"edits": [{"type": "prune_context"}]}
 SAMPLE_CORPUS = Path(__file__).parent / "sample_corpus"
 
 MAX_ROUNDS = 4  # search rounds before the model is asked to answer
@@ -246,29 +254,30 @@ def _type_schema(hint: Any) -> dict[str, Any]:
 @dataclass
 class Episode:
     tools: Tools
-    messages: list[dict[str, Any]]
+    messages: list[dict[str, Any]]  # local transcript, for the record; never resent
     usage: Counter[str] = field(default_factory=Counter)
     generations: int = 0
+    completion_id: str | None = None
+    context_edits: list[dict[str, Any]] = field(default_factory=list)
 
 
 def run(client: Any, query: str, *, corpus: Path = SAMPLE_CORPUS) -> dict[str, Any]:
     """Search ``corpus`` for ``query``; returns the answer, usage and the transcript."""
     tools = Tools(load_corpus(corpus))
     offered = [tool_schema(tool) for tool in tools.by_name().values()]
-    episode = Episode(
-        tools, [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": query}]
-    )
+    episode = Episode(tools, [])
+    new = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": query}]
     for round_index in range(1, MAX_ROUNDS + 1):
         if round_index > 1:
-            episode.messages.append(_user(f"Search round {round_index} of {MAX_ROUNDS}."))
-        message = _complete(client, episode, tools=offered, tool_choice="auto")
+            new.append(_user(f"Search round {round_index} of {MAX_ROUNDS}."))
+        message = _complete(client, episode, new, tools=offered, tool_choice="auto")
         calls = list(message.tool_calls or [])
         if not calls:  # no tool calls: the reply is the answer
             return _record(episode, message.content or "", forced=False)
-        for call in calls:  # in the model's order; a network backend would run them concurrently
-            episode.messages.append(_tool_message(call, _execute(tools, call)))
-    episode.messages.append(_user(ROUND_LIMIT))
-    message = _complete(client, episode, tools=offered, tool_choice="none")
+        # in the model's order; a network backend would run them concurrently
+        new = [_tool_message(call, _execute(tools, call)) for call in calls]
+    new.append(_user(ROUND_LIMIT))
+    message = _complete(client, episode, new, tools=offered, tool_choice="none")
     answer = (message.content or "").strip()
     if not answer:
         raise RuntimeError("the model returned no answer after the search limit")
@@ -276,25 +285,37 @@ def run(client: Any, query: str, *, corpus: Path = SAMPLE_CORPUS) -> dict[str, A
 
 
 def _complete(
-    client: Any, episode: Episode, *, tools: list[dict[str, Any]], tool_choice: str
+    client: Any,
+    episode: Episode,
+    new: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]],
+    tool_choice: str,
 ) -> Any:
-    """One request; appends the assistant turn to the history and returns its message."""
+    """One request continuing the stored completion; only ``new`` messages are sent."""
+    extension = {"context_management": CONTEXT_MANAGEMENT}  # extension fields ride in extra_body
+    if episode.completion_id is not None:
+        extension["previous_completion_id"] = episode.completion_id
     response = client.chat.completions.create(
         model=MODEL,
-        messages=episode.messages,
+        messages=new,
         tools=tools,  # local tools only
         tool_choice=tool_choice,
         parallel_tool_calls=tool_choice == "auto",
+        extra_body=extension,
         **SAMPLING,
     )
+    episode.completion_id = response.id  # the next request continues here
     episode.generations += 1
     if response.usage is not None:
         episode.usage["prompt_tokens"] += response.usage.prompt_tokens
         episode.usage["completion_tokens"] += response.usage.completion_tokens
+    applied = (getattr(response, "context_management", None) or {}).get("applied_edits") or []
+    episode.context_edits.extend(applied)
     message = response.choices[0].message
     turn = message.model_dump(exclude_none=True)
     turn.pop("reasoning_content", None)  # display narration, not history
-    episode.messages.append(turn)
+    episode.messages.extend([*new, turn])
     return message
 
 
@@ -318,6 +339,8 @@ def _record(episode: Episode, answer: str, *, forced: bool) -> dict[str, Any]:
         ],
         "forced_final": forced,
         "generations": episode.generations,
+        "completion_id": episode.completion_id,
+        "context_edits": episode.context_edits,
         "usage": dict(episode.usage),
         "messages": episode.messages,
     }
@@ -364,6 +387,8 @@ def main() -> int:
         record["generations"],
         "forced:",
         record["forced_final"],
+        "pruned tokens:",
+        sum(edit.get("cleared_input_tokens", 0) for edit in record["context_edits"]),
         "usage:",
         record["usage"],
     )

@@ -26,20 +26,26 @@ reads `MXBAI_API_KEY` from the environment or a `.env` file, or takes it as
 
 ## `hosted_tools.py`: the API runs the search
 
-Declare the hosted `store_search` and `store_grep` tools for `--store` and the
+Declare the hosted `search_corpus` and `grep` tools for `--store` and the
 API executes them inside the completion: the model searches as often as it
 needs and the request returns with the answer. `include` returns the chunks
 every hosted call retrieved, which the script prints as the evidence behind
-the answer.
+the answer. `context_management` lets the model prune results it no longer
+needs when a long search approaches the context window; the script prints
+what was cleared.
 
 ## `own_harness.py`: your own retrieval
 
 The tool-call loop from the [build-your-own-harness guide](https://www.mixedbread.com/docs/agent/build-your-own-harness)
 in one file: `bm25_search` and `grep` over a directory of text files, up to
 four search rounds with parallel tool calls, tool failures returned to the
-model as data, and a plain-text answer once the model stops calling tools. The
-tool docstrings and `Annotated` hints are the schema the model sees, so
-connecting your own backend means replacing the two tool bodies in `Tools`.
+model as data, and a plain-text answer once the model stops calling tools.
+The loop continues one stored completion: every request after the first names
+the previous completion as `previous_completion_id` and sends only the new
+tool results, and `context_management` lets the model prune tool results it
+no longer needs on the server, yours included. The tool docstrings and
+`Annotated` hints are the schema the model sees, so connecting your own
+backend means replacing the two tool bodies in `Tools`.
 It ships a thirteen-document sample corpus about a fictional sensor maker,
 with distractors such as a sensor that lacks Modbus TCP and a second,
 unrelated firmware line, so the answers have to come from retrieval;
@@ -48,10 +54,10 @@ unrelated firmware line, so the answers have to come from retrieval;
 ## `agent_harness_on_api.py`: the toast-harness loop
 
 The full harness (`pip install toast-harness`) on the hosted model: its
-search, grep and read tools over a Mixedbread store, context management, and
-a structured ending. `--answer-mode none` ends with a ranked list of chunks,
-`submit_ranking` with the ranking plus an answer, and `plain_text` with an
-answer only; `--top-k` sets the length of the ranking.
+search, grep and read tools over a Mixedbread store, its own client-side
+context management, and a structured ending. `--answer-mode none` ends with a
+ranked list of chunks, `submit_ranking` with the ranking plus an answer, and
+`plain_text` with an answer only; `--top-k` sets the length of the ranking.
 
 `tests/completions/` drives all three scripts against a scripted model; no
 API key is spent.

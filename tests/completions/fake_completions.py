@@ -58,6 +58,7 @@ def response(
     prompt_tokens: int = 100,
     completion_tokens: int = 10,
     hosted_tool_calls: Iterable[dict[str, Any]] = (),
+    context_management: dict[str, Any] | None = None,
     completion_id: str = "cmpl_1",
 ) -> SimpleNamespace:
     calls = list(tool_calls)
@@ -65,6 +66,7 @@ def response(
     return SimpleNamespace(
         id=completion_id,
         hosted_tool_calls=list(hosted_tool_calls),
+        context_management=context_management,
         choices=[SimpleNamespace(finish_reason="tool_calls" if calls else "stop", message=message)],
         usage=SimpleNamespace(
             prompt_tokens=prompt_tokens,

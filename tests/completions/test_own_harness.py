@@ -126,8 +126,9 @@ def test_a_fan_out_round_then_a_plain_text_answer() -> None:
                     grep("ET-001", call_id="call_b"),
                 ],
                 reasoning_content="planning",
+                completion_id="cmpl_a",
             ),
-            response(content=ANSWER),
+            response(content=ANSWER, completion_id="cmpl_b"),
         ]
     )
     record = harness.run(client, QUERY, corpus=SAMPLE_CORPUS)
@@ -135,14 +136,20 @@ def test_a_fan_out_round_then_a_plain_text_answer() -> None:
     assert first["model"] == "toast-1"
     assert first["tool_choice"] == "auto"
     assert first["parallel_tool_calls"] is True
-    assert first["store"] is False
+    assert "store" not in first  # stored by default: the next request continues it
     assert [tool["function"]["name"] for tool in first["tools"]] == ["bm25_search", "grep"]
     assert first["messages"] == [
         {"role": "system", "content": harness.SYSTEM_PROMPT},
         {"role": "user", "content": QUERY},
     ]
-    # One tool message per call, in the model's order, then the round label.
-    assert "reasoning_content" not in second["messages"][2]
+    assert first["extra_body"] == {"context_management": harness.CONTEXT_MANAGEMENT}
+    # The continuation sends only the new messages: one tool message per call,
+    # in the model's order, then the round label.
+    assert second["extra_body"] == {
+        "context_management": harness.CONTEXT_MANAGEMENT,
+        "previous_completion_id": "cmpl_a",
+    }
+    assert [message["role"] for message in second["messages"]] == ["tool", "tool", "user"]
     assert [message["tool_call_id"] for message in tool_messages(second)] == ["call_a", "call_b"]
     grepped = json.loads(tool_messages(second)[1]["content"])
     assert grepped["pattern"] == "ET-001"
@@ -150,7 +157,12 @@ def test_a_fan_out_round_then_a_plain_text_answer() -> None:
     assert record["answer"] == ANSWER
     assert record["forced_final"] is False
     assert record["generations"] == 2
+    assert record["completion_id"] == "cmpl_b"
     assert record["usage"] == {"prompt_tokens": 200, "completion_tokens": 20}
+    # The local transcript still stitches the whole conversation for the record.
+    assert record["messages"][2]["role"] == "assistant"
+    assert "reasoning_content" not in record["messages"][2]
+    assert record["messages"][-1] == {"role": "assistant", "content": ANSWER}
     shown = {
         hit["chunk_id"]
         for message in tool_messages(second)
@@ -162,25 +174,37 @@ def test_a_fan_out_round_then_a_plain_text_answer() -> None:
 
 def test_the_round_limit_withholds_the_tools() -> None:
     searches = [
-        response(tool_calls=[search(f"query {n}", call_id=f"call_{n}")])
+        response(tool_calls=[search(f"query {n}", call_id=f"call_{n}")], completion_id=f"cmpl_{n}")
         for n in range(harness.MAX_ROUNDS)
     ]
     client = ScriptedClient([*searches, response(content="The evidence is insufficient.")])
     record = harness.run(client, QUERY, corpus=SAMPLE_CORPUS)
+    # Every request after the first continues the completion before it.
+    chained = [request["extra_body"].get("previous_completion_id") for request in client.requests]
+    assert chained == [None, "cmpl_0", "cmpl_1", "cmpl_2", "cmpl_3"]
+    labels = [request["messages"][-1]["content"] for request in client.requests[1:-1]]
+    assert labels == [f"Search round {n} of 4." for n in range(2, harness.MAX_ROUNDS + 1)]
     final = client.requests[-1]
     assert [tool["function"]["name"] for tool in final["tools"]] == ["bm25_search", "grep"]
     assert final["tool_choice"] == "none"
     assert final["parallel_tool_calls"] is False
-    labels = [
-        message["content"]
-        for message in final["messages"]
-        if message["role"] == "user" and message["content"].startswith("Search round")
-    ]
-    assert labels == [f"Search round {n} of 4." for n in range(2, harness.MAX_ROUNDS + 1)]
+    assert [message["role"] for message in final["messages"]] == ["tool", "user"]
     assert final["messages"][-1] == {"role": "user", "content": harness.ROUND_LIMIT}
     assert record["answer"] == "The evidence is insufficient."
     assert record["forced_final"] is True
     assert record["generations"] == harness.MAX_ROUNDS + 1
+
+
+def test_applied_context_edits_aggregate_across_the_chain() -> None:
+    pruned = {"applied_edits": [{"type": "prune_context", "calls": 1, "cleared_input_tokens": 900}]}
+    client = ScriptedClient(
+        [
+            response(tool_calls=[search("Nordhavn", call_id="call_a")], context_management=pruned),
+            response(content=ANSWER, context_management=pruned),
+        ]
+    )
+    record = harness.run(client, QUERY, corpus=SAMPLE_CORPUS)
+    assert record["context_edits"] == pruned["applied_edits"] * 2
 
 
 def test_an_empty_final_reply_raises() -> None:

@@ -30,12 +30,12 @@ client = openai.OpenAI(
 completion = client.chat.completions.create(
     model="toast-1",
     messages=[{"role": "user", "content": "Which robot vacuums run for at least 200 minutes?"}],
-    tools=[{"type": "store_search", "store_identifiers": ["my-store"]}],
+    tools=[{"type": "search_corpus", "store_identifiers": ["my-store"]}],
 )
 print(completion.choices[0].message.content)
 ```
 
-The hosted `store_search` runs inside the API for as many rounds as the model
+The hosted `search_corpus` runs inside the API for as many rounds as the model
 wants; none of them come back as tool calls, and the answer arrives as plain
 content.
 
@@ -71,14 +71,14 @@ no key is spent.
 
 ### What the API does for you, and what you own
 
-- **Hosted tools are opt-in.** `store_search`, `store_grep`, `store_list_chunks`,
-  `store_metadata_facets` and `list_stores` run inside the completion for exactly
-  the requests that list them in `tools`; `store_identifiers` pins the store(s),
-  or omit it and add `list_stores` to let the model pick one. `hosted_tools.py`
-  lists `store_search` and `store_grep`. List none of them to bring your own
-  backend: every tool call then comes back to your loop as an ordinary function
-  call that you answer with one tool message, which is what `own_harness.py`
-  and `agent_harness_on_api.py` do.
+- **Hosted tools are opt-in.** `search_corpus`, `grep`, `filter_chunks`,
+  `inspect_metadata`, `get_chunks` and `list_stores` run inside the completion
+  for exactly the requests that list them in `tools`; `store_identifiers` pins
+  the store(s), or omit it and add `list_stores` to let the model pick one.
+  `hosted_tools.py` lists `search_corpus` and `grep`. List none of them to bring
+  your own backend: every tool call then comes back to your loop as an ordinary
+  function call that you answer with one tool message, which is what
+  `own_harness.py` and `agent_harness_on_api.py` do.
 - **The answer arrives as plain content.** When the model has enough evidence it
   replies in prose with `finish_reason="stop"`; `hosted_tools.py` and
   `own_harness.py` take that reply as the answer. For a structured ending,
@@ -87,14 +87,26 @@ no key is spent.
   `agent_harness_on_api.py` does with `submit_ranking`.
 - **Hosted results are visible on request.** The response carries
   `hosted_tool_calls` (queries, pattern, status); the chunks themselves ride
-  along with `extra_body={"include": ["store_search_call.results",
-  "store_grep_call.results"]}`, keyed by `filename` and `chunk_index`.
+  along with `extra_body={"include": ["search_corpus_call.results",
+  "grep_call.results"]}`, keyed by `filename` and `chunk_index`.
   `hosted_tools.py` prints them as the evidence behind the answer.
-- **Completions are stored by default.** With `store=True` a follow-up request
-  can name the previous completion as `previous_completion_id` and continue it
-  with everything the hosted tools retrieved. The examples send `store=False`:
-  each request is complete in itself. `usage.prompt_tokens` counts the hosted
-  rounds too.
+- **Context management is opt-in.** `context_management={"edits": [{"type":
+  "prune_context"}]}` gives the model a `prune_context` tool that runs inside
+  the API: every tool result, your own function tools' included, becomes
+  addressable, and the model clears the ones it no longer needs as the
+  conversation approaches the context window. The response reports the effect
+  as `context_management.applied_edits` (`calls`, `cleared_input_tokens`);
+  a request whose context was never edited carries no `context_management`
+  object. `hosted_tools.py` and `own_harness.py` declare it.
+  `agent_harness_on_api.py` does not: the harness ships its own client-side
+  `prune_context` tool, and a request may not declare both.
+- **Completions are stored by default.** A follow-up request can then name the
+  previous completion as `previous_completion_id` and continue it with
+  everything the model retrieved, pruned and read still in place, sending only
+  the new messages. `own_harness.py` runs its whole loop this way: each round
+  sends just the new tool results. `hosted_tools.py` is a single request and
+  opts out with `store=False`. `usage.prompt_tokens` counts the hosted rounds
+  too.
 
 [`completions/README.md`](completions/README.md) has the per-script details.
 The [Completions API docs](https://www.mixedbread.com/docs/agent/chat-completions)
