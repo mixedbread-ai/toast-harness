@@ -7,7 +7,7 @@ from fake_completions import ScriptedClient, response
 
 SEARCHED = [
     {
-        "type": "store_search_call",
+        "type": "search_corpus_call",
         "id": "ss_1",
         "status": "completed",
         "queries": ["Hoover HW500 run time", "robot vacuum battery minutes"],
@@ -22,7 +22,7 @@ SEARCHED = [
         ],
     },
     {
-        "type": "store_grep_call",
+        "type": "grep_call",
         "id": "sg_1",
         "status": "completed",
         "pattern": "HW500",
@@ -40,13 +40,14 @@ def test_one_request_declares_the_hosted_tools_and_asks_for_their_results() -> N
     (request,) = client.requests
     assert request["messages"] == [{"role": "user", "content": QUESTION}]
     assert request["tools"] == [
-        {"type": "store_search", "store_identifiers": ["catalog"]},
-        {"type": "store_grep", "store_identifiers": ["catalog"]},
+        {"type": "search_corpus", "store_identifiers": ["catalog"]},
+        {"type": "grep", "store_identifiers": ["catalog"]},
     ]
     assert "tool_choice" not in request
     assert request["store"] is False
     assert request["extra_body"] == {
-        "include": ["store_search_call.results", "store_grep_call.results"]
+        "include": ["search_corpus_call.results", "grep_call.results"],
+        "context_management": {"edits": [{"type": "prune_context"}]},
     }
 
 
@@ -58,8 +59,28 @@ def test_the_record_is_the_answer_with_what_the_api_ran_and_retrieved() -> None:
     assert record == {
         "answer": "It runs for 30 minutes.",
         "hosted_calls": SEARCHED,
+        "context_edits": [],
         "usage": {"prompt_tokens": 100, "completion_tokens": 10},
     }
+
+
+def test_applied_context_edits_reach_the_record() -> None:
+    client = ScriptedClient(
+        [
+            response(
+                content="It runs for 30 minutes.",
+                context_management={
+                    "applied_edits": [
+                        {"type": "prune_context", "calls": 2, "cleared_input_tokens": 5_400}
+                    ]
+                },
+            )
+        ]
+    )
+    record = hosted_tools.ask(client, QUESTION, store="catalog")
+    assert record["context_edits"] == [
+        {"type": "prune_context", "calls": 2, "cleared_input_tokens": 5_400}
+    ]
 
 
 def test_an_answer_without_hosted_calls_is_still_a_record() -> None:

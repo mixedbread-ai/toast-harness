@@ -74,8 +74,8 @@ def main() -> int:
     if not api_key:
         parser.error("pass --api-key or set MXBAI_API_KEY")
     if not os.environ.get("AGENT_HARNESS_TOKENIZER"):
-        # no tokenizer configured: budget on the built-in token estimate
-        os.environ.setdefault("AGENT_HARNESS_REQUIRE_EXACT_TOKENIZER", "0")
+        # the hosted model's tokenizer is not available locally
+        os.environ["AGENT_HARNESS_TOKENIZER"] = "estimate"
     import openai  # noqa: PLC0415
 
     client = openai.OpenAI(base_url=BASE_URL, api_key=api_key)
