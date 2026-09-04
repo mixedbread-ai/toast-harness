@@ -58,6 +58,9 @@ search, grep and read tools over a Mixedbread store, its own client-side
 context management, and a structured ending. `--answer-mode none` ends with a
 ranked list of chunks, `submit_ranking` with the ranking plus an answer, and
 `plain_text` with an answer only; `--top-k` sets the length of the ranking.
+The hosted model's tokenizer is not available locally, so the script budgets
+on the harness's token estimate (`AGENT_HARNESS_TOKENIZER=estimate`); point
+that variable at a tokenizer checkpoint to count exactly.
 
 `tests/completions/` drives all three scripts against a scripted model; no
 API key is spent.

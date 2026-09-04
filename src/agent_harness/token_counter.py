@@ -12,7 +12,10 @@ install it up front with ``ensure_token_counter``.
 
 Configuration:
 
-- ``AGENT_HARNESS_TOKENIZER`` -- load this checkpoint instead of ``model``.
+- ``AGENT_HARNESS_TOKENIZER`` -- load this checkpoint instead of ``model``; or
+  ``estimate`` to budget on the ``chars/4`` heuristic by choice: no tokenizer is
+  looked up and the exactness requirement below is satisfied. For a hosted
+  policy whose tokenizer is not available locally.
 - ``AGENT_HARNESS_TOKEN_COUNTER_BACKEND`` -- ``gigatoken`` (default) or ``hf``.
   gigatoken must pass an exact token-ID parity check against the HF tokenizer
   before it is installed, and any failure falls back to HF -- the fast path is
@@ -43,6 +46,8 @@ import agent_harness.config as harness_config
 
 _LOGGER = logging.getLogger(__name__)
 _LOCK = threading.Lock()
+# The AGENT_HARNESS_TOKENIZER value that opts into the chars/4 estimate outright.
+ESTIMATE_TOKENIZER = "estimate"
 # Model name whose tokenizer is installed (or whose load was attempted and
 # failed); guards against reloading / re-warning on every rollout.
 _RESOLVED_MODEL: str | None = None
@@ -106,12 +111,17 @@ def ensure_rollout_token_counter(model: str | None) -> None:
     ``count_text_tokens``, so a rollout that starts without a tokenizer silently
     budgets JSON-heavy payloads with the chars/4 heuristic and can overflow the
     deployment's ``max_model_len``. By default such a rollout fails here instead
-    of running mismeasured; AGENT_HARNESS_REQUIRE_EXACT_TOKENIZER=0 allows it.
+    of running mismeasured; AGENT_HARNESS_REQUIRE_EXACT_TOKENIZER=0 allows it, as
+    does choosing the estimate outright with AGENT_HARNESS_TOKENIZER=estimate.
     """
     ensure_token_counter(model)
-    if harness_config.TOKEN_COUNTER is not None or not _require_exact_tokenizer():
+    if (
+        harness_config.TOKEN_COUNTER is not None
+        or _estimate_requested()
+        or not _require_exact_tokenizer()
+    ):
         return
-    override = os.environ.get("AGENT_HARNESS_TOKENIZER", "").strip()
+    override = _tokenizer_override()
     reason = _LAST_LOAD_ERROR or "no tokenizer load was attempted"
     msg = (
         "Exact token counting is required but no tokenizer could be installed "
@@ -133,19 +143,37 @@ def _require_exact_tokenizer() -> bool:
     return raw not in {"0", "false", "no", "off", ""}
 
 
+def _tokenizer_override() -> str:
+    return os.environ.get("AGENT_HARNESS_TOKENIZER", "").strip()
+
+
+def _estimate_requested() -> bool:
+    """Whether AGENT_HARNESS_TOKENIZER asks for the chars/4 estimate by name."""
+    return _tokenizer_override().lower() == ESTIMATE_TOKENIZER
+
+
 def ensure_token_counter(model: str | None) -> None:
     """Install ``model``'s tokenizer as the harness token counter, once.
 
     Idempotent per model and safe under concurrency. On any failure to load the
     tokenizer (e.g. a served alias that is not a resolvable checkpoint) the
     harness keeps its char-based estimate; the failure is logged once, not per
-    rollout.
+    rollout. ``AGENT_HARNESS_TOKENIZER=estimate`` keeps the estimate by choice:
+    no load is attempted and nothing is warned.
     """
     global _RESOLVED_MODEL  # noqa: PLW0603
     if not model or model == _RESOLVED_MODEL:
         return
     with _LOCK:
         if model == _RESOLVED_MODEL:
+            return
+        if _estimate_requested():
+            _LOGGER.info(
+                "agent_harness.token_counter: AGENT_HARNESS_TOKENIZER=%s; budgeting on the "
+                "chars/4 estimate, no tokenizer loaded.",
+                ESTIMATE_TOKENIZER,
+            )
+            _RESOLVED_MODEL = model
             return
         tokenizer = _load_tokenizer(model)
         if tokenizer is not None:
@@ -173,7 +201,7 @@ def _load_tokenizer(model: str) -> object | None:
     # The served model name may be an alias (e.g. an adapter name) that no
     # tokenizer resolves for; AGENT_HARNESS_TOKENIZER names
     # the base checkpoint to load instead.
-    override = os.environ.get("AGENT_HARNESS_TOKENIZER", "").strip()
+    override = _tokenizer_override()
     last_error: Exception | None = None
     for name in [override, model] if override else [model]:
         try:

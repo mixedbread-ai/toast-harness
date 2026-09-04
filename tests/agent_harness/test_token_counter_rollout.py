@@ -243,3 +243,29 @@ async def test_the_requirement_defaults_on_and_opting_out_degrades(
         assert result.to_record()["token_counter_mode"] == "chars-heuristic"
     finally:
         config.set_token_counter(None)
+
+
+def test_asking_for_the_estimate_loads_nothing_and_satisfies_the_requirement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``AGENT_HARNESS_TOKENIZER=estimate`` is the explicit choice of the heuristic:
+    no checkpoint is looked up, and the exactness requirement does not fail the
+    rollout even though it is on."""
+    loads = _spy_tokenizer_loads(monkeypatch, _WordTokenizer())
+    monkeypatch.setenv("AGENT_HARNESS_TOKENIZER", token_counter.ESTIMATE_TOKENIZER)
+    monkeypatch.setenv("AGENT_HARNESS_REQUIRE_EXACT_TOKENIZER", "1")
+    monkeypatch.setitem(config.SEARCHER_AGENT_CONFIG, "model", UNRESOLVABLE_MODEL)
+    captured = _stub_searcher_io(monkeypatch)
+    config.set_token_counter(None)
+    try:
+        record = run_searcher(
+            "find the launch ads",
+            store_identifiers=["store-a"],
+            generation_fn=_searcher_generation_fn(captured),
+        )
+
+        assert loads == []
+        assert config.TOKEN_COUNTER is None
+        assert record["openai"]["metadata"]["token_counter_mode"] == "chars-heuristic"
+    finally:
+        config.set_token_counter(None)

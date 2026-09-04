@@ -376,7 +376,12 @@ FINAL_ANSWER_CORRECTION_MESSAGE = (
 )
 
 SEARCHER_AGENT_CONFIG: dict[str, Any] = {
-    "model": "gpt-5.5",
+    # The policy the harness drives: toast-1, the released search model. The
+    # harness never sends this name itself (a generation_fn names the served
+    # model); it is the checkpoint whose tokenizer measures the token budgets
+    # when AGENT_HARNESS_TOKENIZER names none. Overridable for a deployment
+    # that serves the policy under another name.
+    "model": os.environ.get("AGENT_HARNESS_MODEL", "toast-1"),
     "reasoning_effort": "high",
     # Wire-level tool_choice. Defaults to "auto", which leaves decoding
     # unconstrained; "required" changes the sampling distribution on engines

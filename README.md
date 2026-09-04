@@ -244,11 +244,12 @@ conformance-tests a retrieval binding by driving one real rollout against it.
 ### Token counting
 
 Every rollout installs the policy tokenizer at its entry point -- from
-`AGENT_HARNESS_TOKENIZER`, else the model name in `SEARCHER_AGENT_CONFIG` -- so
-budgets count what the model will see. The counter used is recorded on the
-record as `openai.metadata.token_counter_mode`; a rollout whose tokenizer will
-not load fails unless `AGENT_HARNESS_REQUIRE_EXACT_TOKENIZER=0` allows the
-`chars/4` estimate.
+`AGENT_HARNESS_TOKENIZER`, else the model name in `SEARCHER_AGENT_CONFIG`
+(`AGENT_HARNESS_MODEL`, default `toast-1`) -- so budgets count what the model
+will see. The counter used is recorded on the record as
+`openai.metadata.token_counter_mode`; a rollout whose tokenizer will not load
+fails unless `AGENT_HARNESS_REQUIRE_EXACT_TOKENIZER=0` allows the `chars/4`
+estimate. 
 
 ### Running BrowseComp-Plus
 
@@ -275,6 +276,7 @@ python examples/browsecomp/run.py out/ queries.json
 | `MXBAI_BASE_URL` | Point the store client at a non-default Mixedbread deployment (aliases `MBREAD_BASE_URL`, `MIXEDBREAD_BASE_URL`). |
 | `AGENT_HARNESS_TOOL_CHOICE` | Override the wire `tool_choice` sent to the model. Per-rollout `HarnessTuning(tool_choice=...)` wins. |
 | `KEEP_REASONING_HISTORY` | Round-trip `reasoning_content` back into the message history. Off by default. |
+| `AGENT_HARNESS_MODEL` | The policy model name the rollout carries (default `toast-1`); its tokenizer is the token counter when `AGENT_HARNESS_TOKENIZER` is unset. |
 | `AGENT_HARNESS_REQUIRE_EXACT_TOKENIZER` | On by default; set to `0` to allow the `chars/4` estimate when no tokenizer loads. |
 | `AGENT_HARNESS_TOKENIZER` | Load this checkpoint as the token counter instead of the model name the rollout carries. |
 | `AGENT_HARNESS_TOKEN_COUNTER_BACKEND` | `gigatoken` (default, parity-checked against HF) or `hf`. |
