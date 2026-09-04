@@ -1,8 +1,11 @@
 """Bring your own search backend: toast-1 over the Completions API with local tools.
 
 A complete tool-call loop in one file. The model searches a directory of text
-files with two local tools, ``bm25_search`` and ``grep``, and answers in plain
-text once the evidence is sufficient:
+files with two local tools, ``bm25_search`` and ``grep``, and ends the episode
+with a third, ``submit_answer``, once the evidence is sufficient: a structured
+answer, as the toast harness ends on ``submit_ranking``, with the answer in its
+``answer`` argument and the model's reasoning in ``chain_of_thought``. Every
+turn has to call a tool, and the last round asks for ``submit_answer`` by name:
 
     python own_harness.py [--corpus DIR] [--out FILE] "question"
 
@@ -41,13 +44,13 @@ SAMPLING = {"temperature": 0.7, "top_p": 0.95}
 CONTEXT_MANAGEMENT = {"edits": [{"type": "prune_context"}]}
 SAMPLE_CORPUS = Path(__file__).parent / "sample_corpus"
 
-MAX_ROUNDS = 4  # search rounds before the model is asked to answer
+MAX_ROUNDS = 6  # rounds of tool calls; the last one asks for submit_answer
 MAX_PARALLEL_CALLS = 8  # per-turn fan-out the prompt asks for
 TOP_K_MAX = 20
 CLIP_CHARS = 2_000  # per chunk in a search result, about 500 tokens
 
 SYSTEM_PROMPT = f"""You are a search agent answering a user query from a document corpus with \
-search tools. Search until the evidence is sufficient, then answer in plain text.
+search tools. Search until the evidence is sufficient, then call submit_answer.
 
 - Plan first, then fan out: several bm25_search and grep calls in one turn that chase different \
 aspects, entities and wording of the query; at most {MAX_PARALLEL_CALLS} tool calls per turn. \
@@ -56,14 +59,15 @@ Follow-up searches pivot to what is still missing, not to paraphrases.
 regular expression against literal text: use it for identifiers, codes, dates and exact phrases. \
 bm25_search returns only chunks you have not seen yet; grep also confirms matches in seen ones.
 - You have at most {MAX_ROUNDS} rounds of tool calls; from the second round on, a "Search round \
-N of {MAX_ROUNDS}." line marks the round.
-- A reply without tool calls ends the episode: make it your answer, based only on the retrieved \
-evidence. If the evidence is insufficient, say so.
+N of {MAX_ROUNDS}." line marks the round, and the last round is marked as the last.
+- submit_answer ends the episode: your reasoning in chain_of_thought, and in answer only the \
+answer, based on the retrieved evidence alone. If the evidence is insufficient, say so in answer.
 """
-ROUND_LIMIT = (
-    "You have reached the search limit. Do not search further: answer the query now in plain "
-    "text, based only on the retrieved evidence. If it is insufficient, say so."
+LAST_ROUND = (
+    f"Search round {MAX_ROUNDS} of {MAX_ROUNDS}: the last one. Call submit_answer now, based "
+    "only on the retrieved evidence. If it is insufficient, say so in answer."
 )
+SUBMIT_ONLY = {"type": "function", "function": {"name": "submit_answer"}}  # by name, last round
 
 
 # --- the corpus: text files split into chunks with stable handles ----------------------
@@ -132,16 +136,17 @@ class BM25:
         return sorted(scored, key=lambda hit: -hit[1])
 
 
-# --- the tools: two searches over one corpus ---------------------------------------------
+# --- the tools: two searches over one corpus, and the terminal submit_answer ------------
 
 
 class Tools:
-    """The model's search tools over one corpus: every public method is a tool.
+    """The model's tools: every public method is one.
 
     The docstring is the description the model follows and the ``Annotated``
     strings are the parameter descriptions; ``tool_schema`` reads both off the
     signature. ``seen`` holds every chunk shown so far, by handle:
     ``bm25_search`` skips those chunks, while ``grep`` still reports them.
+    ``submit_answer`` is the terminal tool: a valid call to it ends the episode.
     """
 
     def __init__(self, chunks: list[Chunk]) -> None:
@@ -150,7 +155,11 @@ class Tools:
         self.seen: dict[str, Chunk] = {}
 
     def by_name(self) -> dict[str, Callable[..., dict[str, Any]]]:
-        return {"bm25_search": self.bm25_search, "grep": self.grep}
+        return {
+            "bm25_search": self.bm25_search,
+            "grep": self.grep,
+            "submit_answer": self.submit_answer,
+        }
 
     def bm25_search(
         self,
@@ -200,6 +209,22 @@ class Tools:
         hits.sort(key=lambda hit: -hit[1])
         results = [{**self._show(c), "match_count": n} for c, n in hits[:top_k]]
         return {"pattern": pattern, "candidate_count": len(results), "results": results}
+
+    def submit_answer(
+        self,
+        chain_of_thought: Annotated[
+            str, "Your reasoning: how the retrieved evidence supports the answer."
+        ],
+        answer: Annotated[
+            str,
+            "The answer to the user's query as one or two complete sentences of plain text: "
+            "the facts asked for, with no account of the evidence or of your search.",
+        ],
+    ) -> dict[str, Any]:
+        """End the episode with your answer, once the evidence is sufficient. Put your
+        reasoning about the evidence in chain_of_thought and only the answer to the
+        user's query in answer; if the evidence is insufficient, say so in answer."""
+        return {"chain_of_thought": chain_of_thought, "answer": answer}
 
     def _show(self, chunk: Chunk) -> dict[str, Any]:
         """The result entry for ``chunk``, which counts as seen from now on."""
@@ -262,26 +287,36 @@ class Episode:
 
 
 def run(client: Any, query: str, *, corpus: Path = SAMPLE_CORPUS) -> dict[str, Any]:
-    """Search ``corpus`` for ``query``; returns the answer, usage and the transcript."""
+    """Search ``corpus`` for ``query``; returns the submitted answer, usage and the transcript."""
     tools = Tools(load_corpus(corpus))
     offered = [tool_schema(tool) for tool in tools.by_name().values()]
     episode = Episode(tools, [])
     new = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": query}]
     for round_index in range(1, MAX_ROUNDS + 1):
+        last = round_index == MAX_ROUNDS
         if round_index > 1:
-            new.append(_user(f"Search round {round_index} of {MAX_ROUNDS}."))
-        message = _complete(client, episode, new, tools=offered, tool_choice="auto")
-        calls = list(message.tool_calls or [])
-        if not calls:  # no tool calls: the reply is the answer
-            return _record(episode, message.content or "", forced=False)
+            new.append(
+                _user(LAST_ROUND if last else f"Search round {round_index} of {MAX_ROUNDS}.")
+            )
+        # every round has to call a tool, so the model ends by calling submit_answer
+        # rather than by falling silent; the last round asks for it by name
+        message = _complete(
+            client, episode, new, tools=offered, tool_choice=SUBMIT_ONLY if last else "required"
+        )
         # in the model's order; a network backend would run them concurrently
-        new = [_tool_message(call, _execute(tools, call)) for call in calls]
-    new.append(_user(ROUND_LIMIT))
-    message = _complete(client, episode, new, tools=offered, tool_choice="none")
-    answer = (message.content or "").strip()
-    if not answer:
-        raise RuntimeError("the model returned no answer after the search limit")
-    return _record(episode, answer, forced=True)
+        results = [(call, _execute(tools, call)) for call in message.tool_calls or []]
+        if (submitted := _submission(results)) is not None:
+            return _record(episode, submitted, rounds=round_index)
+        new = [_tool_message(call, result) for call, result in results]
+    raise RuntimeError("the model did not call submit_answer on the last round")
+
+
+def _submission(results: list[tuple[Any, dict[str, Any]]]) -> dict[str, Any] | None:
+    """The first valid submit_answer result of a turn; a failed one goes back as data."""
+    for call, result in results:
+        if call.function.name == "submit_answer" and "error" not in result:
+            return result
+    return None
 
 
 def _complete(
@@ -290,7 +325,7 @@ def _complete(
     new: list[dict[str, Any]],
     *,
     tools: list[dict[str, Any]],
-    tool_choice: str,
+    tool_choice: str | dict[str, Any],
 ) -> Any:
     """One request continuing the stored completion; only ``new`` messages are sent."""
     extension = {"context_management": CONTEXT_MANAGEMENT}  # extension fields ride in extra_body
@@ -301,7 +336,7 @@ def _complete(
         messages=new,
         tools=tools,  # local tools only
         tool_choice=tool_choice,
-        parallel_tool_calls=tool_choice == "auto",
+        parallel_tool_calls=tool_choice == "required",  # fan out to search, one call to submit
         extra_body=extension,
         **SAMPLING,
     )
@@ -330,14 +365,15 @@ def _execute(tools: Tools, call: Any) -> dict[str, Any]:
         return {"error": str(exc)}
 
 
-def _record(episode: Episode, answer: str, *, forced: bool) -> dict[str, Any]:
+def _record(episode: Episode, submitted: dict[str, Any], *, rounds: int) -> dict[str, Any]:
     return {
-        "answer": answer,
+        "answer": submitted["answer"],
+        "chain_of_thought": submitted["chain_of_thought"],
         "seen": [
             {"chunk_id": c.chunk_id, "filename": c.filename, "chunk_index": c.chunk_index}
             for c in episode.tools.seen.values()
         ],
-        "forced_final": forced,
+        "rounds": rounds,
         "generations": episode.generations,
         "completion_id": episode.completion_id,
         "context_edits": episode.context_edits,
@@ -385,8 +421,8 @@ def main() -> int:
         len(record["seen"]),
         "generations:",
         record["generations"],
-        "forced:",
-        record["forced_final"],
+        "rounds:",
+        record["rounds"],
         "pruned tokens:",
         sum(edit.get("cleared_input_tokens", 0) for edit in record["context_edits"]),
         "usage:",

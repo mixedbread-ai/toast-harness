@@ -7,7 +7,7 @@ answer is produced:
 | Script | Retrieval | Ends with |
 | --- | --- | --- |
 | `hosted_tools.py` | The API's hosted store tools: one request, no retrieval code | A plain-text answer, printed with the chunks the hosted tools retrieved |
-| `own_harness.py` | Your own tools: `bm25_search` and `grep` over a directory of text files | A plain-text answer once the model stops calling tools |
+| `own_harness.py` | Your own tools: `bm25_search` and `grep` over a directory of text files | The `answer` of `submit_answer`, the terminal tool the model calls once the evidence is sufficient |
 | `agent_harness_on_api.py` | The toast-harness loop and its Stores tools | A ranked list of chunks, a plain-text answer, or both (`--answer-mode`) |
 
 ```bash
@@ -38,8 +38,12 @@ what was cleared.
 
 The tool-call loop from the [build-your-own-harness guide](https://www.mixedbread.com/docs/agent/build-your-own-harness)
 in one file: `bm25_search` and `grep` over a directory of text files, up to
-four search rounds with parallel tool calls, tool failures returned to the
-model as data, and a plain-text answer once the model stops calling tools.
+six rounds of parallel tool calls, tool failures returned to the model as
+data, and a terminal `submit_answer` tool whose `answer` argument is the
+answer and whose `chain_of_thought` argument takes the reasoning. Every round
+has to call a tool (`tool_choice="required"`), so the model ends by calling
+`submit_answer` rather than by trailing off into prose, and the last round
+asks for it by name.
 The loop continues one stored completion: every request after the first names
 the previous completion as `previous_completion_id` and sends only the new
 tool results, and `context_management` lets the model prune tool results it

@@ -47,7 +47,7 @@ split of who does the retrieval and how the answer is produced:
 | Script | Retrieval | Ends with |
 | --- | --- | --- |
 | [`hosted_tools.py`](completions/hosted_tools.py) | The API's hosted store tools: one request, no retrieval code | A plain-text answer, printed with the chunks the hosted tools retrieved |
-| [`own_harness.py`](completions/own_harness.py) | Your own tools: `bm25_search` and `grep` over a directory of text files | A plain-text answer once the model stops calling tools |
+| [`own_harness.py`](completions/own_harness.py) | Your own tools: `bm25_search` and `grep` over a directory of text files | The `answer` of `submit_answer`, the terminal tool the model calls once the evidence is sufficient |
 | [`agent_harness_on_api.py`](completions/agent_harness_on_api.py) | The toast-harness loop and its Stores tools | A ranked list of chunks, a plain-text answer, or both ([`--answer-mode`](#answer-modes)) |
 
 The first two need nothing beyond the `openai` SDK: the endpoint is
@@ -80,11 +80,12 @@ no key is spent.
   function call that you answer with one tool message, which is what
   `own_harness.py` and `agent_harness_on_api.py` do.
 - **The answer arrives as plain content.** When the model has enough evidence it
-  replies in prose with `finish_reason="stop"`; `hosted_tools.py` and
-  `own_harness.py` take that reply as the answer. For a structured ending,
-  declare your own terminal function and force it by name on the final turn
-  (`tool_choice={"type": "function", "function": {"name": ...}}`), as
-  `agent_harness_on_api.py` does with `submit_ranking`.
+  replies in prose with `finish_reason="stop"`, which is what `hosted_tools.py`
+  prints. For a structured ending, declare your own terminal function and name
+  it in `tool_choice` (`{"type": "function", "function": {"name": ...}}`), as
+  the toast harness does with `submit_ranking` and `own_harness.py` with
+  `submit_answer`. `tool_choice="required"` on the rounds before it keeps the
+  model calling tools until it calls that one.
 - **Hosted results are visible on request.** The response carries
   `hosted_tool_calls` (queries, pattern, status); the chunks themselves ride
   along with `extra_body={"include": ["search_corpus_call.results",
