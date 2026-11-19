@@ -23,6 +23,7 @@ from agent_harness.agents.searcher import FastAgenticSearchResult
 from agent_harness.concurrency import run_coroutine_sync
 from agent_harness.config import STRICT_TOPK, HarnessTuning, MediaContentInput
 from agent_harness.llm import GenerationFn, sync_generation_as_async
+from agent_harness.reranking import AsyncReranker
 from agent_harness.retrieval import (
     AsyncRetrievalClient,
     RetrievalClient,
@@ -89,6 +90,7 @@ def run_fast_agentic_search(
     tuning: HarnessTuning | None = None,
     as_of: date | None = None,
     answer_mode: AnswerMode = "none",
+    reranker: AsyncReranker | None = None,
 ) -> FastAgenticSearchResult:
     """Sync ``agents.searcher.run_fast_agentic_search`` with adapted seams."""
     return run_coroutine_sync(
@@ -107,6 +109,7 @@ def run_fast_agentic_search(
             tuning=tuning,
             as_of=as_of,
             answer_mode=answer_mode,
+            reranker=reranker,
         )
     )
 
@@ -127,6 +130,7 @@ def fast_agentic_search(
     tuning: HarnessTuning | None = None,
     as_of: date | None = None,
     answer_mode: AnswerMode = "none",
+    reranker: AsyncReranker | None = None,
 ) -> dict[str, Any]:
     """Run the fast searcher and return the plain-dict record payload."""
     return run_fast_agentic_search(
@@ -144,6 +148,7 @@ def fast_agentic_search(
         tuning=tuning,
         as_of=as_of,
         answer_mode=answer_mode,
+        reranker=reranker,
     ).to_record()
 
 

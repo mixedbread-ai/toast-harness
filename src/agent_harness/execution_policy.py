@@ -31,6 +31,7 @@ from agent_harness.llm import (
     require_generation_fn,
     sync_generation_as_async,
 )
+from agent_harness.reranking import AsyncReranker
 from agent_harness.retrieval import (
     AsyncRetrievalClient,
     RetrievalClient,
@@ -62,6 +63,7 @@ async def run_searcher_async(
     tuning: HarnessTuning | None = None,
     as_of: date | None = None,
     answer_mode: AnswerMode = "none",
+    reranker: AsyncReranker | None = None,
 ) -> dict[str, Any]:
     """Async native: input -> fixed searcher -> Responses API rollout record."""
     require_generation_fn(generation_fn)
@@ -81,6 +83,7 @@ async def run_searcher_async(
         tuning=tuning,
         as_of=as_of,
         answer_mode=answer_mode,
+        reranker=reranker,
     )
     runtime_s = perf_counter() - started
     return build_rollout_result(
@@ -122,6 +125,7 @@ class SearcherExecutionPolicy:
         tuning: HarnessTuning | None = None,
         as_of: date | None = None,
         answer_mode: AnswerMode = "none",
+        reranker: AsyncReranker | None = None,
     ) -> dict[str, Any]:
         return run_coroutine_sync(
             run_searcher_async(
@@ -141,6 +145,7 @@ class SearcherExecutionPolicy:
                 tuning=tuning,
                 as_of=as_of,
                 answer_mode=answer_mode,
+                reranker=reranker,
             )
         )
 
@@ -163,6 +168,7 @@ def run_searcher(
     tuning: HarnessTuning | None = None,
     as_of: date | None = None,
     answer_mode: AnswerMode = "none",
+    reranker: AsyncReranker | None = None,
 ) -> dict[str, Any]:
     """Convenience function for input -> fixed searcher -> Responses API rollout."""
     return SearcherExecutionPolicy(generation_fn=generation_fn).run(
@@ -181,6 +187,7 @@ def run_searcher(
         tuning=tuning,
         as_of=as_of,
         answer_mode=answer_mode,
+        reranker=reranker,
     )
 
 
@@ -226,6 +233,8 @@ def build_rollout_result(
         "retrieval": retrieval,
         "answer_mode": result.get("answer_mode", "none"),
     }
+    if result.get("reranking") is not None:
+        record["submission"] = jsonable(result["ranking"])
     if retrieval.get("answer"):
         record["answer"] = retrieval["answer"]
     return record
@@ -236,6 +245,7 @@ def build_retrieval(result: Mapping[str, Any]) -> dict[str, Any]:
         {
             "ranked_ids": ranked_ids(result),
             "chunks": list(result.get("chunks") or []),
+            "reranking": result.get("reranking"),
             "answer": result.get("answer"),
             "ranking_strategy": result.get("ranking_strategy"),
             "top_k": result.get("top_k"),

@@ -9,14 +9,15 @@ from typing import Any
 from pydantic import BaseModel
 
 from agent_harness import config
+from agent_harness.llm import load_tool_arguments
 
 
 def parse_tool_args(tool_call: Any, schema: type[BaseModel] | None) -> Any:
     if schema is None:
         return {"error": f"Unknown tool: {tool_call.function.name}"}
     try:
-        raw = json.loads(tool_call.function.arguments)
-    except (TypeError, json.JSONDecodeError) as exc:
+        raw = load_tool_arguments(tool_call.function.arguments)
+    except (TypeError, ValueError) as exc:
         return {"error": f"Invalid JSON: {exc}"}
     try:
         return schema.model_validate(raw)

@@ -70,6 +70,12 @@ from agent_harness.prompts import (
     over_budget_message,
     round_notice_message,
 )
+from agent_harness.reranking import (
+    AsyncReranker,
+    RerankingUsage,
+    SearchTrajectory,
+    TrajectoryGeneration,
+)
 from agent_harness.retrieval import AsyncRetrievalClient
 from agent_harness.schemas import (
     AnsweredRankedChunkList,
@@ -185,6 +191,7 @@ class FastAgenticSearchResult:
     prompt_snapshot: dict[str, Any] | None = None
     answer: str | None = None
     answer_mode: AnswerMode = "none"
+    reranking: RerankingUsage | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -199,6 +206,7 @@ class FastAgenticSearchResult:
                 if isinstance(chunk, Mapping) and chunk.get("chunk_id")
             ],
             "chunks": self.chunks,
+            **({"reranking": self.reranking.model_dump()} if self.reranking is not None else {}),
             "answer": self.answer,
             "ranking_strategy": self.ranking.ranking_strategy if self.ranking else None,
             "top_k": self.top_k,
@@ -213,6 +221,7 @@ class FastAgenticSearchResult:
             "answer": self.answer,
             "answer_mode": self.answer_mode,
             "chunks": self.chunks,
+            **({"reranking": self.reranking.model_dump()} if self.reranking is not None else {}),
             "top_k": self.top_k,
             "strict_top_k": self.strict_top_k,
             "media_content": self.media_content,
@@ -449,6 +458,7 @@ async def fast_agentic_search(
     tuning: HarnessTuning | None = None,
     as_of: date | None = None,
     answer_mode: AnswerMode = "none",
+    reranker: AsyncReranker | None = None,
 ) -> dict[str, Any]:
     """Run the fast searcher and return the plain-dict record payload."""
     result = await run_fast_agentic_search(
@@ -466,6 +476,7 @@ async def fast_agentic_search(
         tuning=tuning,
         as_of=as_of,
         answer_mode=answer_mode,
+        reranker=reranker,
     )
     return result.to_record()
 
@@ -486,6 +497,7 @@ async def run_fast_agentic_search(
     tuning: HarnessTuning | None = None,
     as_of: date | None = None,
     answer_mode: AnswerMode = "none",
+    reranker: AsyncReranker | None = None,
 ) -> FastAgenticSearchResult:
     """Run the fast searcher and return structured loop state.
 
@@ -520,6 +532,7 @@ async def run_fast_agentic_search(
             generation_fn=generation_fn,
             as_of=as_of,
             answer_mode=answer_mode,
+            reranker=reranker,
         )
 
 
@@ -537,6 +550,7 @@ async def _run_scoped_fast_agentic_search(
     generation_fn: AsyncGenerationFn | None,
     as_of: date | None,
     answer_mode: AnswerMode,
+    reranker: AsyncReranker | None,
 ) -> FastAgenticSearchResult:
     """The rollout proper: bootstrap, the round loop, the forced tail, the result."""
     generate = require_generation_fn(generation_fn)
@@ -548,6 +562,11 @@ async def _run_scoped_fast_agentic_search(
     effective_top_k, effective_strict_top_k = _resolve_ranking_shape(top_k, strict_top_k)
 
     index = ChunkIndex()
+    trajectory = (
+        SearchTrajectory(index) if effective_strict_top_k and reranker is not None else None
+    )
+    if trajectory is not None:
+        generate = TrajectoryGeneration(generate, trajectory)
     bootstrap = await _fetch_initial_context(
         user_text,
         index=index,
@@ -593,7 +612,7 @@ async def _run_scoped_fast_agentic_search(
         force = _force_final_answer if config.answers_in_text else _force_final_ranking
         run.final = await force(messages, run, generate=generate, config=config)
 
-    return _build_search_result(
+    result = _build_search_result(
         messages=messages,
         bootstrap=bootstrap,
         run=run,
@@ -602,6 +621,13 @@ async def _run_scoped_fast_agentic_search(
         additional_instructions=additional_instructions,
         prompt_snapshot=prompt_snapshot,
     )
+    if trajectory is not None and result.ranking is not None:
+        assert reranker is not None
+        assert effective_top_k is not None
+        result.chunks, result.reranking = await trajectory.rerank(
+            user_text, reranker, top_k=effective_top_k
+        )
+    return result
 
 
 def _resolve_ranking_shape(top_k: int | None, strict_top_k: bool) -> tuple[int | None, bool]:
@@ -954,9 +980,7 @@ async def _force_final_ranking(
         messages,
         tools=_round_tools(config),
         completion_config=_rollout_completion_config(config.answer_mode),
-        validate=lambda ranking: validate_ranked_chunk_ids(
-            ranking, config.index, top_k=config.top_k, strict_top_k=config.strict_top_k
-        ),
+        validate=lambda ranking: validate_ranked_chunk_ids(ranking, config.index),
         require_answer=config.requires_answer,
         responses_trace=run.openai_responses,
         response_trace_metadata=tail.trace_metadata,
@@ -1262,7 +1286,7 @@ def _searcher_tools(
     there is no final tool to advertise.
     """
     tools = [
-        overview_search_tool(),
+        overview_search_tool(top_k=harness_config.AGENT_OVERVIEW_SEARCH_TOP_K),
         search_corpus_tool(),
         filter_chunks_tool(),
         grep_tool(),
@@ -1510,9 +1534,7 @@ def _record_final_ranking(
         return
     try:
         ranking = parse_ranking(tool_call.function.arguments, require_answer=config.requires_answer)
-        validate_ranked_chunk_ids(
-            ranking, config.index, top_k=config.top_k, strict_top_k=config.strict_top_k
-        )
+        validate_ranked_chunk_ids(ranking, config.index)
         state.final_result = ranking
         finish_tool_call_trace(
             trace_event, output={"ranking": ranking_trace_payload(ranking, config.index)}

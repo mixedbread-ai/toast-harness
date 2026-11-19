@@ -79,8 +79,7 @@ _OVERVIEW_SEARCH_OMITTED_CONTENT_FIELDS = (
     "video_url",
     "content_url",
 )
-_OVERVIEW_TEXT_FALLBACK_SUMMARY_MAX_CHARS = 240
-_OVERVIEW_TEXT_FALLBACK_SUMMARY_MAX_SENTENCES = 2
+_OVERVIEW_TEXT_FALLBACK_SUMMARY_MAX_CHARS = 1200
 
 _mxbai_clients: dict[tuple[str, str], Mixedbread] = {}
 _mxbai_clients_lock = RLock()
@@ -1376,7 +1375,8 @@ async def overview_search(
 
     for chunk in chunks:
         serialized = serialize_chunk(chunk)
-        _populate_summary(serialized, allow_text_fallback=True)
+        if not serialized.get("summary") and (summary := _text_fallback_summary(chunk)):
+            serialized["summary"] = summary
         if not _summary_text(serialized.get("summary")):
             missing_summary_count += 1
         for field in _OVERVIEW_SEARCH_OMITTED_CONTENT_FIELDS:
@@ -1533,13 +1533,12 @@ def serialize_chunk(
         "context": payload.get("context"),
         "ocr_text": payload.get("ocr_text"),
         "transcription": payload.get("transcription"),
-        "summary": payload.get("summary"),
+        "summary": _summary_text(payload.get("summary")),
         "metadata": payload.get("metadata"),
         "generated_metadata": payload.get("generated_metadata"),
         "image_url": payload.get("image_url"),
         "media_url": payload.get("media_url") or payload.get("url"),
     }
-    _populate_summary(result)
     return _drop_none(result)
 
 
@@ -1864,7 +1863,7 @@ def _compact_metadata_payload(value: Any) -> Any:
 def _truncate(value: str, max_chars: int) -> str:
     if len(value) <= max_chars:
         return value
-    return value[: max_chars - 1].rstrip() + "..."
+    return value[: max_chars - 3].rstrip() + "..."
 
 
 def _resolve_store_identifiers(
@@ -1911,39 +1910,13 @@ def _summary_text(value: Any) -> str | None:
     return summary or None
 
 
-def _populate_summary(
-    chunk: dict[str, Any],
-    *,
-    allow_text_fallback: bool = False,
-) -> None:
-    mixedbread_summary = _summary_text(chunk.get("summary"))
-    if mixedbread_summary:
-        chunk["summary"] = mixedbread_summary
-        return
-
-    text_summary = _text_fallback_summary(chunk.get("text")) if allow_text_fallback else None
-    if text_summary:
-        chunk["summary"] = text_summary
-    else:
-        chunk.pop("summary", None)
-
-
-def _text_fallback_summary(value: Any) -> str | None:
-    if not isinstance(value, str):
-        return None
-    text = re.sub(r"\s+", " ", value).strip()
-    if not text:
-        return None
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    first_sentences = " ".join(
-        sentence.strip()
-        for sentence in sentences[:_OVERVIEW_TEXT_FALLBACK_SUMMARY_MAX_SENTENCES]
-        if sentence.strip()
-    )
-    return _truncate(
-        first_sentences or text,
-        _OVERVIEW_TEXT_FALLBACK_SUMMARY_MAX_CHARS,
-    )
+def _text_fallback_summary(chunk: Mapping[str, Any]) -> str | None:
+    for field in ("context", "text", "ocr_text", "transcription", "content"):
+        value = chunk.get(field)
+        if isinstance(value, str) and value.strip():
+            text = re.sub(r"\s+", " ", value).strip()
+            return _truncate(text, _OVERVIEW_TEXT_FALLBACK_SUMMARY_MAX_CHARS)
+    return None
 
 
 def _drop_none(payload: Mapping[str, Any]) -> dict[str, Any]:

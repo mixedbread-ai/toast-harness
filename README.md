@@ -252,12 +252,29 @@ will see. The counter used is recorded on the record as
 fails unless `AGENT_HARNESS_REQUIRE_EXACT_TOKENIZER=0` allows the `chars/4`
 estimate. 
 
+### Strict top-k and reranking
+
+Pass `strict_top_k=True, top_k=10` to request ten chunks. A shorter submission is
+accepted, a longer one is capped, and unknown chunk IDs still receive a correction.
+To rerank after the search, also pass `reranker=` with an async `rerank(request)`
+method. The request contains the original question with search history and the
+documents Toast saw, including evidence it later pruned. Return a
+`RerankResult` with one finite score per document index. The BrowseComp example
+includes an adapter for the Mixedbread rerank API.
+
+On a reranked `run_searcher` rollout, `result["submission"]` holds Toast's
+original ranking, `result["retrieval"]["chunks"]` holds the delivered chunks,
+and `result["retrieval"]["reranking"]` records the reranker model, candidate
+count, input tokens, and duration. Tied scores keep first-seen order.
+`AGENT_HARNESS_SEARCH_RERANK` applies separately to each store search.
+
 ### Running BrowseComp-Plus
 
 `examples/browsecomp/` drives BrowseComp-Plus queries through the harness and
 scores the resulting rankings. With a served model up:
 
 ```bash
+python -m pip install . openai transformers     # from this checkout
 export MXBAI_API_KEY=...                       # retrieval
 export AGENT_HARNESS_TOKENIZER=/models/my-policy-model
 export TOAST_MODEL_BASE_URL=http://127.0.0.1:30000/v1
@@ -265,11 +282,28 @@ export TOAST_ANSWER_MODE=none                  # or submit_ranking / plain_text
 python examples/browsecomp/run.py out/ queries.json
 ```
 
+For a strict ranking, add `--strict-top-k`. To include a final Mixedbread rerank,
+add `--rerank-model MODEL`, which also enables strict top-k. Both options require
+a ranking answer mode.
+
+`client_summary.json` includes nDCG@10 and recall@10 for labeled rankings.
+The runner completes the batch and exits nonzero if a query raised an error.
+
 `queries.json` is a list of `{"query_id", "query", "relevant_ids"}` rows.
 `examples/browsecomp/scoring.py` scores a rollout's ranking:
 `score(rollout["retrieval"], row["relevant_ids"])` returns nDCG@10 and recall@10.
 
+The agent previews up to 50 unseen chunks per `overview_search`. The standalone
+function defaults to 25, as recorded in the published v1 contract. Overview
+previews use a stored summary when available, then fall back to context or body text.
+
 ### Configuration
+
+`HarnessTuning(search_overfetch_factor=...)` sets the candidate multiplier for
+search, grep, and overview in one rollout. An explicit `backend_top_k` takes
+precedence for corpus search. `HarnessTuning(mode="production")` clamps integer
+`filter_chunks.k` values above the ceiling and accepts the last value of a
+repeated JSON key. Use `mode="training"` to reject both cases.
 
 | Variable | Effect |
 | --- | --- |

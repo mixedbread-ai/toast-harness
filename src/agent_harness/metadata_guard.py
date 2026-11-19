@@ -254,10 +254,13 @@ def build_metadata_registry(
                 chunk.get("metadata"),
                 source="result_metadata",
             )
+            # Stores resolve a bare filter key under `metadata.`, so a generated
+            # field is only filterable by its `generated_metadata.` path.
             _add_metadata_payload(
                 registry,
                 chunk.get("generated_metadata"),
                 source="result_metadata",
+                prefix="generated_metadata",
             )
     return registry
 

@@ -15,12 +15,12 @@ import regex as _clip_regex
 
 from . import config
 from .config import (
+    AGENT_OVERVIEW_SEARCH_TOP_K,
     GREP_DEFAULT_K,
-    OVERVIEW_SEARCH_TOP_K,
     SEARCH_CORPUS_MAX_QPS,
     SEARCH_CORPUS_TOP_K,
-    SEARCH_OVERFETCH_FACTOR,
     corpus_backend_top_k,
+    search_overfetch_factor,
 )
 from .errors import is_provider_failure
 from .references import ReferenceRegistry
@@ -728,7 +728,7 @@ async def execute_grep(
     api_key_env: str | None = None,
 ) -> ToolOutcome:
     requested_k = GREP_DEFAULT_K
-    fetch_k = requested_k * SEARCH_OVERFETCH_FACTOR
+    fetch_k = requested_k * search_overfetch_factor()
     targets = args.get("targets") or ["text", "generated"]
     filter_by = args.get("filter_by") or args.get("metadata_filters") or []
     case_sensitive = bool(args.get("case_sensitive", False))
@@ -874,12 +874,12 @@ async def execute_overview_search(
     api_key_env: str | None = None,
 ) -> ToolOutcome:
     query = str(args["query"]).strip()
-    top_k = OVERVIEW_SEARCH_TOP_K
+    top_k = AGENT_OVERVIEW_SEARCH_TOP_K
     # Half the search_corpus overfetch: dedup drops already-seen chunks, so a
     # bare top_k fetch returns fewer and fewer results as an episode goes on.
     # Overview payloads are summary-only, so they need less headroom than the
     # full-text search paths to still fill top_k after dedup.
-    search_top_k = top_k * (SEARCH_OVERFETCH_FACTOR // 2)
+    search_top_k = top_k * max(1, search_overfetch_factor() // 2)
     result = await overview_search(
         query,
         store_identifiers=store_identifiers,

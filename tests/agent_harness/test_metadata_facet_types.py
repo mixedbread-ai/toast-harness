@@ -14,6 +14,7 @@ from agent_harness.metadata_guard import (
     validate_metadata_filter_args,
 )
 from agent_harness.prompts import initial_metadata_facets_message
+from agent_harness.search import ChunkIndex
 from agent_harness.tools import functions
 from agent_harness.tools.functions import (
     _collect_metadata_value_types,
@@ -154,6 +155,31 @@ def test_registry_still_rejects_numeric_comparison_for_string_fields() -> None:
 
     assert len(result.invalid) == 1
     assert result.invalid[0]["reason"] == "value type does not match field"
+
+
+def test_registry_knows_generated_fields_by_their_filterable_path() -> None:
+    index = ChunkIndex()
+    index.add_chunk(
+        {
+            "store_id": "store-a",
+            "file_id": "file-a",
+            "chunk_index": 0,
+            "text": "fn main() {}",
+            "metadata": {"source": "rust-book"},
+            "generated_metadata": {"language": "rust", "start_line": 3},
+        }
+    )
+    registry = build_metadata_registry(index=index)
+
+    def invalid(key: str, value: object) -> list[dict]:
+        args = {"filter_by": [{"key": key, "operator": "eq", "value": value}]}
+        return validate_metadata_filter_args(args, registry=registry).invalid
+
+    assert invalid("source", "rust-book") == []
+    assert invalid("generated_metadata.language", "rust") == []
+    assert invalid("generated_metadata.start_line", "3") == []
+    # A bare key reads user metadata, where this chunk has no such field.
+    assert invalid("language", "rust")[0]["reason"] == "unknown metadata field"
 
 
 async def test_filter_chunks_falls_back_to_client_side_ranking(

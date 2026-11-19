@@ -89,17 +89,22 @@ GET_CHUNKS_TOOL: dict[str, Any] = {
     },
 }
 
+
+def _overview_description(top_k: int) -> str:
+    return (
+        f"Executes a semantic search query and returns a high-level overview of up to {top_k} "
+        "relevant chunks not yet seen by the current agent. The overview contains a summary of each chunk's content. "
+        "Overview results carry no metadata and no chunk text, so no attribute constraint can be "
+        "verified from them: re-fetch the returned handles with get_chunks, or use filter_chunks "
+        "or grep, before treating a constraint as checked."
+    )
+
+
 OVERVIEW_SEARCH_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
         "name": "overview_search",
-        "description": (
-            f"Executes a semantic search query and returns a high-level overview of up to {OVERVIEW_SEARCH_TOP_K} "
-            "relevant chunks not yet seen by the current agent. The overview contains a summary of each chunk's content. "
-            "Overview results carry no metadata and no chunk text, so no attribute constraint can be "
-            "verified from them: re-fetch the returned handles with get_chunks, or use filter_chunks "
-            "or grep, before treating a constraint as checked."
-        ),
+        "description": _overview_description(OVERVIEW_SEARCH_TOP_K),
         "parameters": {
             "type": "object",
             "properties": {
@@ -155,8 +160,10 @@ PRUNE_CONTEXT_TOOL: dict[str, Any] = {
 }
 
 
-def overview_search_tool() -> dict[str, Any]:
-    return deepcopy(OVERVIEW_SEARCH_TOOL)
+def overview_search_tool(*, top_k: int = OVERVIEW_SEARCH_TOP_K) -> dict[str, Any]:
+    tool = deepcopy(OVERVIEW_SEARCH_TOOL)
+    tool["function"]["description"] = _overview_description(top_k)
+    return tool
 
 
 def read_document_tool(
