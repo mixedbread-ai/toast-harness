@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+from types import SimpleNamespace
 
 import agent_harness_on_api as example
 import pytest
@@ -62,6 +63,9 @@ def test_main_budgets_on_the_estimate_unless_a_tokenizer_is_configured(
         monkeypatch.delenv("AGENT_HARNESS_TOKENIZER", raising=False)
     else:
         monkeypatch.setenv("AGENT_HARNESS_TOKENIZER", configured)
+    monkeypatch.setitem(
+        sys.modules, "openai", SimpleNamespace(OpenAI=lambda **_: ScriptedClient([]))
+    )
     monkeypatch.setattr(example.agent_harness, "run_searcher", _stub_rollout)
     monkeypatch.setattr(
         sys, "argv", ["agent_harness_on_api.py", "--store", "s", "--api-key", "k", "q"]
