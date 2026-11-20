@@ -19,9 +19,12 @@ from agent_harness.tools import functions
 EXAMPLE = Path(__file__).resolve().parents[2] / "examples" / "browsecomp"
 
 
-@pytest.mark.parametrize("shell_key", [None, "test-from-shell"])
+@pytest.mark.parametrize(
+    ("shell_key", "flags"),
+    [(None, []), ("test-from-shell", ["--strict-top-k"]), (None, ["--no-strict-top-k"])],
+)
 def test_reranked_batch_keeps_submission_and_reports_failed_queries(
-    tmp_path, monkeypatch, shell_key
+    tmp_path, monkeypatch, shell_key, flags
 ):
     labels = ["relevant"]
     queries = [
@@ -29,7 +32,7 @@ def test_reranked_batch_keeps_submission_and_reports_failed_queries(
     ]
     query_file = tmp_path / "queries.json"
     query_file.write_text(json.dumps(queries))
-    monkeypatch.setattr(sys, "argv", ["run.py", str(tmp_path), str(query_file), "--strict-top-k"])
+    monkeypatch.setattr(sys, "argv", ["run.py", str(tmp_path), str(query_file), *flags])
     example = tmp_path / "example"
     example.mkdir()
     shutil.copyfile(EXAMPLE / "run.py", example / "run.py")
@@ -109,6 +112,11 @@ def test_reranked_batch_keeps_submission_and_reports_failed_queries(
     failed, completed = json.loads((tmp_path / "client_summary.json").read_text())
     assert "model offline" in failed["error"]
     assert completed["error"] is None
+    if "--no-strict-top-k" in flags:
+        assert requests == []
+        assert completed["ranked_docids"] == ["other"]
+        assert "reranking" not in completed
+        return
     assert len(requests) == 1
     assert requests[0]["model"] == "mixedbread-ai/mxbai-rerank-v3.1-listwise"
     assert len(requests[0]["input"]) == requests[0]["top_k"] == 2

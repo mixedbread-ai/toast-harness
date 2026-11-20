@@ -446,7 +446,7 @@ async def fast_agentic_search(
     *,
     store_identifiers: Sequence[str],
     top_k: int | None = None,
-    strict_top_k: bool = STRICT_TOPK,
+    strict_top_k: bool | None = STRICT_TOPK,
     client: AsyncRetrievalClient | None = None,
     api_key: str | None = None,
     api_key_env: str | None = None,
@@ -483,7 +483,7 @@ async def run_fast_agentic_search(
     *,
     store_identifiers: Sequence[str],
     top_k: int | None = None,
-    strict_top_k: bool = STRICT_TOPK,
+    strict_top_k: bool | None = STRICT_TOPK,
     client: AsyncRetrievalClient | None = None,
     api_key: str | None = None,
     api_key_env: str | None = None,
@@ -536,7 +536,7 @@ async def _run_scoped_fast_agentic_search(
     *,
     store_identifiers: Sequence[str],
     top_k: int | None,
-    strict_top_k: bool,
+    strict_top_k: bool | None,
     client: AsyncRetrievalClient | None,
     api_key: str | None,
     api_key_env: str | None,
@@ -621,16 +621,14 @@ async def _run_scoped_fast_agentic_search(
     return result
 
 
-def _resolve_ranking_shape(top_k: int | None, strict_top_k: bool) -> tuple[int | None, bool]:
-    """Normalize the requested ranking shape.
-
-    A strict top-k with no k falls back to the default k; strictness without a
-    k to enforce is meaningless and is dropped.
-    """
+def _resolve_ranking_shape(top_k: int | None, strict_top_k: bool | None) -> tuple[int | None, bool]:
+    """An explicit k enables reranking unless the caller opts out."""
     effective_top_k = normalize_top_k(top_k)
+    if strict_top_k is None:
+        return effective_top_k, effective_top_k is not None
     if strict_top_k and effective_top_k is None:
         effective_top_k = AGENTIC_SEARCH_DEFAULT_K
-    return effective_top_k, bool(strict_top_k and effective_top_k is not None)
+    return effective_top_k, strict_top_k
 
 
 def _build_search_result(
@@ -1277,7 +1275,7 @@ def _searcher_tools(
     there is no final tool to advertise.
     """
     tools = [
-        overview_search_tool(top_k=harness_config.AGENT_OVERVIEW_SEARCH_TOP_K),
+        overview_search_tool(),
         search_corpus_tool(),
         filter_chunks_tool(),
         grep_tool(),

@@ -254,8 +254,10 @@ estimate.
 
 ### Strict top-k and reranking
 
-Pass `strict_top_k=True, top_k=10` to return up to ten chunks. After Toast
-submits, the harness sends the original query, search history, and candidate
+Pass `top_k=10` to return up to ten reranked chunks. Set `strict_top_k=False`
+to use Toast’s submitted ranking. Omitting both arguments leaves the ranking uncapped.
+
+After Toast submits, the harness sends the original query, search history, and candidate
 texts to the Mixedbread rerank API using `mixedbread-ai/mxbai-rerank-v3.1-listwise`.
 This includes evidence shown earlier and later pruned. The rerank call needs a
 Mixedbread API key and works with candidates from any retrieval backend.
@@ -285,26 +287,16 @@ export TOAST_ANSWER_MODE=none                  # or submit_ranking / plain_text
 python examples/browsecomp/run.py out/ queries.json
 ```
 
-Add `--strict-top-k` to use final listwise reranking in either ranking answer mode.
-
-`client_summary.json` includes nDCG@10 and recall@10 for labeled rankings.
-The runner completes the batch and exits nonzero if a query raised an error.
+BrowseComp reranks the observed evidence and returns up to 10 chunks by default
+in either ranking mode. Use `--no-strict-top-k` to evaluate Toast’s own ranking.
+For labeled rankings, `client_summary.json` reports nDCG@10 and recall@10.
+If a query fails, the runner finishes the batch, records the error, and exits nonzero.
 
 `queries.json` is a list of `{"query_id", "query", "relevant_ids"}` rows.
 `examples/browsecomp/scoring.py` scores a rollout's ranking:
 `score(rollout["retrieval"], row["relevant_ids"])` returns nDCG@10 and recall@10.
 
-The agent previews up to 50 unseen chunks per `overview_search`. The standalone
-function defaults to 25, as recorded in the published v1 contract. Overview
-previews use a stored summary when available, then fall back to context or body text.
-
 ### Configuration
-
-`HarnessTuning(search_overfetch_factor=...)` sets the candidate multiplier for
-search, grep, and overview in one rollout. An explicit `backend_top_k` takes
-precedence for corpus search. `HarnessTuning(mode="production")` clamps integer
-`filter_chunks.k` values above the ceiling and accepts the last value of a
-repeated JSON key. Use `mode="training"` to reject both cases.
 
 | Variable | Effect |
 | --- | --- |

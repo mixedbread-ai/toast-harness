@@ -21,8 +21,7 @@ INITIAL_SEARCH_TOP_K = 5
 # higher GET_CHUNKS_CHUNK_TOKEN_LIMIT, and every tool's call total is bounded
 # by TOOL_CALL_PAYLOAD_TOKEN_BUDGET below.
 SEARCH_CHUNK_TOKEN_LIMIT = 2000
-OVERVIEW_SEARCH_TOP_K = 25
-AGENT_OVERVIEW_SEARCH_TOP_K = 50
+OVERVIEW_SEARCH_TOP_K = 50
 SEARCH_OVERFETCH_FACTOR = 5
 
 
@@ -294,7 +293,7 @@ type MediaContentMode = Literal["auto", "always", "never"]
 type MediaContentInput = MediaContentMode | bool | None
 
 MEDIA_CONTENT_MODES: tuple[MediaContentMode, ...] = ("auto", "always", "never")
-STRICT_TOPK = False
+STRICT_TOPK: bool | None = None  # Infer strict ranking from an explicit top_k.
 
 # Per-rollout setting, not process state: callers run rollouts concurrently,
 # each with its own media_content. A ContextVar gives every thread (and every

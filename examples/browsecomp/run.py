@@ -105,8 +105,8 @@ def main() -> int:
     parser.add_argument("queries", type=Path)
     parser.add_argument(
         "--strict-top-k",
-        action="store_true",
-        help="Rerank the observed evidence with Mixedbread and return up to ten chunks.",
+        action=argparse.BooleanOptionalAction,
+        help="Use final listwise reranking (default for ranking modes).",
     )
     args = parser.parse_args()
     if args.strict_top_k and ANSWER_MODE == "plain_text":

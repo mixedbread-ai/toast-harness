@@ -430,7 +430,7 @@ def stream_fast_agentic_search(
     generation_fn: AsyncGenerationFn,
     client: AsyncRetrievalClient | None = None,
     top_k: int | None = None,
-    strict_top_k: bool = STRICT_TOPK,
+    strict_top_k: bool | None = STRICT_TOPK,
     api_key: str | None = None,
     api_key_env: str | None = None,
     additional_instructions: str | None = None,

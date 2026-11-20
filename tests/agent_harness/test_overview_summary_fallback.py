@@ -42,6 +42,7 @@ async def test_overview_returns_a_readable_preview(monkeypatch, chunk, expected)
     result = await search_provider.overview_search("query", store_identifiers=["store"])
     assert result["results"][0]["summary"] == expected
     assert result["summaries_found"] == 1
+    assert result["top_k"] == 50
 
 
 def test_fallback_collapses_whitespace_and_caps_length():

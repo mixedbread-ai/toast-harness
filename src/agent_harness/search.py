@@ -15,8 +15,8 @@ import regex as _clip_regex
 
 from . import config
 from .config import (
-    AGENT_OVERVIEW_SEARCH_TOP_K,
     GREP_DEFAULT_K,
+    OVERVIEW_SEARCH_TOP_K,
     SEARCH_CORPUS_MAX_QPS,
     SEARCH_CORPUS_TOP_K,
     corpus_backend_top_k,
@@ -874,7 +874,7 @@ async def execute_overview_search(
     api_key_env: str | None = None,
 ) -> ToolOutcome:
     query = str(args["query"]).strip()
-    top_k = AGENT_OVERVIEW_SEARCH_TOP_K
+    top_k = OVERVIEW_SEARCH_TOP_K
     # Half the search_corpus overfetch: dedup drops already-seen chunks, so a
     # bare top_k fetch returns fewer and fewer results as an episode goes on.
     # Overview payloads are summary-only, so they need less headroom than the
