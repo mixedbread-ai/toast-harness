@@ -1,8 +1,4 @@
-"""Strict top_k asks the model for exactly top_k chunks but never rejects a count.
-
-A rollout can only rank what it retrieved. A submission shorter than top_k is
-accepted as it is; a longer one is clipped to its first top_k chunks.
-"""
+"""Strict mode accepts short and long Toast submissions and caps the delivered reranking."""
 
 from __future__ import annotations
 
@@ -44,7 +40,7 @@ def _run_strict(chunk_ids: list[str], *, top_k: int) -> dict[str, Any]:
     )
 
 
-def _submitted_ids(record: dict[str, Any]) -> list[str]:
+def _delivered_ids(record: dict[str, Any]) -> list[str]:
     return [chunk["chunk_id"] for chunk in record["chunks"]]
 
 
@@ -52,11 +48,12 @@ def test_a_submission_shorter_than_top_k_is_accepted() -> None:
     record = _run_strict(["c1"], top_k=len(rs.SEEDED_CHUNK_IDS) + 1)
 
     assert record["forced_ranking"] is False
-    assert _submitted_ids(record) == ["c1"]
+    assert [chunk.chunk_id for chunk in record["ranking"].chunks] == ["c1"]
+    assert _delivered_ids(record) == ["c2", "c1"]
 
 
 def test_a_submission_longer_than_top_k_is_clipped() -> None:
     record = _run_strict(list(rs.SEEDED_CHUNK_IDS), top_k=1)
 
     assert record["forced_ranking"] is False
-    assert _submitted_ids(record) == ["c1"]
+    assert _delivered_ids(record) == ["c2"]

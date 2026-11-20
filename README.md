@@ -254,13 +254,11 @@ estimate.
 
 ### Strict top-k and reranking
 
-Pass `strict_top_k=True, top_k=10` to request ten chunks. A shorter submission is
-accepted, a longer one is capped, and unknown chunk IDs still receive a correction.
-To rerank after the search, also pass `reranker=` with an async `rerank(request)`
-method. The request contains the original question with search history and the
-documents Toast saw, including evidence it later pruned. Return a
-`RerankResult` with one finite score per document index. The BrowseComp example
-includes an adapter for the Mixedbread rerank API.
+Pass `strict_top_k=True, top_k=10` to return up to ten chunks. After Toast
+submits, the harness sends the original query, search history, and candidate
+texts to the Mixedbread rerank API using `mixedbread-ai/mxbai-rerank-v3.1-listwise`.
+This includes evidence shown earlier and later pruned. The rerank call needs a
+Mixedbread API key and works with candidates from any retrieval backend.
 
 On a reranked `run_searcher` rollout, `result["submission"]` holds Toast's
 original ranking, `result["retrieval"]["chunks"]` holds the delivered chunks,
@@ -275,16 +273,15 @@ scores the resulting rankings. With a served model up:
 
 ```bash
 python -m pip install . openai transformers     # from this checkout
-export MXBAI_API_KEY=...                       # retrieval
+cp examples/browsecomp/.env.template examples/browsecomp/.env
+# Set MXBAI_API_KEY in that file, or export it in your shell.
 export AGENT_HARNESS_TOKENIZER=/models/my-policy-model
 export TOAST_MODEL_BASE_URL=http://127.0.0.1:30000/v1
 export TOAST_ANSWER_MODE=none                  # or submit_ranking / plain_text
 python examples/browsecomp/run.py out/ queries.json
 ```
 
-For a strict ranking, add `--strict-top-k`. To include a final Mixedbread rerank,
-add `--rerank-model MODEL`, which also enables strict top-k. Both options require
-a ranking answer mode.
+Add `--strict-top-k` to use final listwise reranking in either ranking answer mode.
 
 `client_summary.json` includes nDCG@10 and recall@10 for labeled rankings.
 The runner completes the batch and exits nonzero if a query raised an error.
@@ -307,7 +304,7 @@ repeated JSON key. Use `mode="training"` to reject both cases.
 
 | Variable | Effect |
 | --- | --- |
-| `MXBAI_API_KEY` | Mixedbread API key (required unless a `client` is injected). `MBREAD_API_KEY` and `MIXEDBREAD_API_KEY` are accepted aliases; pass `api_key_env=` to read some other variable. |
+| `MXBAI_API_KEY` | Mixedbread API key for store retrieval and strict top-k reranking. `MBREAD_API_KEY` and `MIXEDBREAD_API_KEY` are accepted aliases; pass `api_key_env=` to read some other variable. |
 | `MXBAI_BASE_URL` | Point the store client at a non-default Mixedbread deployment (aliases `MBREAD_BASE_URL`, `MIXEDBREAD_BASE_URL`). |
 | `AGENT_HARNESS_TOOL_CHOICE` | Override the wire `tool_choice` sent to the model. Per-rollout `HarnessTuning(tool_choice=...)` wins. |
 | `KEEP_REASONING_HISTORY` | Round-trip `reasoning_content` back into the message history. Off by default. |

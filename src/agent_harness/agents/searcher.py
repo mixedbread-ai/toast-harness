@@ -71,7 +71,6 @@ from agent_harness.prompts import (
     round_notice_message,
 )
 from agent_harness.reranking import (
-    AsyncReranker,
     RerankingUsage,
     SearchTrajectory,
     TrajectoryGeneration,
@@ -458,7 +457,6 @@ async def fast_agentic_search(
     tuning: HarnessTuning | None = None,
     as_of: date | None = None,
     answer_mode: AnswerMode = "none",
-    reranker: AsyncReranker | None = None,
 ) -> dict[str, Any]:
     """Run the fast searcher and return the plain-dict record payload."""
     result = await run_fast_agentic_search(
@@ -476,7 +474,6 @@ async def fast_agentic_search(
         tuning=tuning,
         as_of=as_of,
         answer_mode=answer_mode,
-        reranker=reranker,
     )
     return result.to_record()
 
@@ -497,7 +494,6 @@ async def run_fast_agentic_search(
     tuning: HarnessTuning | None = None,
     as_of: date | None = None,
     answer_mode: AnswerMode = "none",
-    reranker: AsyncReranker | None = None,
 ) -> FastAgenticSearchResult:
     """Run the fast searcher and return structured loop state.
 
@@ -532,7 +528,6 @@ async def run_fast_agentic_search(
             generation_fn=generation_fn,
             as_of=as_of,
             answer_mode=answer_mode,
-            reranker=reranker,
         )
 
 
@@ -550,7 +545,6 @@ async def _run_scoped_fast_agentic_search(
     generation_fn: AsyncGenerationFn | None,
     as_of: date | None,
     answer_mode: AnswerMode,
-    reranker: AsyncReranker | None,
 ) -> FastAgenticSearchResult:
     """The rollout proper: bootstrap, the round loop, the forced tail, the result."""
     generate = require_generation_fn(generation_fn)
@@ -562,9 +556,7 @@ async def _run_scoped_fast_agentic_search(
     effective_top_k, effective_strict_top_k = _resolve_ranking_shape(top_k, strict_top_k)
 
     index = ChunkIndex()
-    trajectory = (
-        SearchTrajectory(index) if effective_strict_top_k and reranker is not None else None
-    )
+    trajectory = SearchTrajectory(index) if effective_strict_top_k else None
     if trajectory is not None:
         generate = TrajectoryGeneration(generate, trajectory)
     bootstrap = await _fetch_initial_context(
@@ -622,10 +614,9 @@ async def _run_scoped_fast_agentic_search(
         prompt_snapshot=prompt_snapshot,
     )
     if trajectory is not None and result.ranking is not None:
-        assert reranker is not None
         assert effective_top_k is not None
         result.chunks, result.reranking = await trajectory.rerank(
-            user_text, reranker, top_k=effective_top_k
+            user_text, top_k=effective_top_k, api_key=api_key, api_key_env=api_key_env
         )
     return result
 

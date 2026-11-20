@@ -45,7 +45,6 @@ from agent_harness.config import STRICT_TOPK, HarnessTuning, MediaContentInput
 from agent_harness.errors import error_kind
 from agent_harness.execution_policy import run_searcher_async as run_searcher
 from agent_harness.llm import AsyncGenerationFn
-from agent_harness.reranking import AsyncReranker
 from agent_harness.retrieval import (
     AsyncRetrievalClient,
     AsyncStoreFiles,
@@ -440,7 +439,6 @@ def stream_fast_agentic_search(
     tuning: HarnessTuning | None = None,
     as_of: date | None = None,
     answer_mode: AnswerMode = "none",
-    reranker: AsyncReranker | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Drive the fast searcher, yielding progress events as it runs.
 
@@ -469,7 +467,6 @@ def stream_fast_agentic_search(
             tuning=tuning,
             as_of=as_of,
             answer_mode=answer_mode,
-            reranker=reranker,
         )
 
     return _stream(

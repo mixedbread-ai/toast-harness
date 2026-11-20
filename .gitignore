@@ -16,6 +16,7 @@ wheels/
 .venv-*/
 .env
 .env.*
+!examples/browsecomp/.env.template
 
 # Test / tooling caches
 .pytest_cache/

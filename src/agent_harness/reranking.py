@@ -1,53 +1,28 @@
-"""Injected final reranking over the evidence actually presented to a searcher.
-
-The caller owns inference and its deadlines. No SDK client, credentials, or
-model deployment is resolved here. Model submissions remain intact for audit;
-only the delivered chunks are replaced by this separate ranking stage.
-"""
+"""Final listwise ranking of the evidence presented to the searcher."""
 
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from mixedbread import AsyncMixedbread
+from pydantic import BaseModel
 
 from agent_harness.llm import AsyncGenerationFn
 from agent_harness.search import ChunkIndex
-from agent_harness.tools.functions import chunk_content_text
+from agent_harness.tools.functions import (
+    chunk_content_text,
+    resolve_mixedbread_api_key,
+    resolve_mixedbread_base_url,
+)
 
-
-class RerankRequest(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    query: str
-    documents: tuple[str, ...]
-
-
-class RerankScore(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    index: int = Field(ge=0, strict=True)
-    score: float = Field(allow_inf_nan=False)
-
-
-class RerankResult(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    scores: tuple[RerankScore, ...]
-    model: str
-    input_tokens: int = Field(default=0, ge=0)
-
-
-class AsyncReranker(Protocol):
-    async def rerank(self, request: RerankRequest) -> RerankResult:
-        """Score every input exactly once, with larger scores more relevant."""
-        ...
+LISTWISE_MODEL = "mixedbread-ai/mxbai-rerank-v3.1-listwise"
 
 
 class RerankingUsage(BaseModel):
@@ -115,7 +90,7 @@ class SearchTrajectory:
                     ):
                         self.candidates[handle] = deepcopy(chunk)
 
-    def request(self, query: str) -> RerankRequest:
+    def contextual_query(self, query: str) -> str:
         referenced = set(re.findall(r"\bc\d+\b", "\n".join(e.assistant for e in self.explanations)))
         references = [
             {
@@ -131,7 +106,7 @@ class SearchTrajectory:
             json.dumps(explanation.model_dump(), ensure_ascii=False)
             for explanation in self.explanations
         )
-        contextual_query = (
+        return (
             f"Original request:\n{query}\n\n"
             "Search history from the agent that retrieved these candidates follows. "
             "Use it as context when assessing relevance to the original request. "
@@ -141,22 +116,30 @@ class SearchTrajectory:
             + "\nChronological search history:\n"
             + history
         )
-        return RerankRequest(
-            query=contextual_query,
-            documents=tuple(rerank_document(chunk) for chunk in self.candidates.values()),
-        )
 
     async def rerank(
-        self, query: str, reranker: AsyncReranker, *, top_k: int
+        self, query: str, *, top_k: int, api_key: str | None, api_key_env: str | None
     ) -> tuple[list[dict[str, Any]], RerankingUsage | None]:
         if not self.candidates:
             return [], None
         started = time.perf_counter()
-        result = await reranker.rerank(self.request(query))
-        positions = [item.index for item in result.scores]
+        documents = [rerank_document(chunk) for chunk in self.candidates.values()]
+        async with AsyncMixedbread(
+            api_key=resolve_mixedbread_api_key(api_key=api_key, api_key_env=api_key_env),
+            base_url=resolve_mixedbread_base_url(),
+        ) as client:
+            result = await client.rerank(
+                model=LISTWISE_MODEL,
+                query=self.contextual_query(query),
+                input=documents,
+                top_k=len(documents),
+            )
+        if any(not math.isfinite(item.score) for item in result.data):
+            raise ValueError("Rerank scores must be finite")
+        positions = [item.index for item in result.data]
         if sorted(positions) != list(range(len(self.candidates))):
             raise ValueError("Reranker must score every candidate exactly once")
-        ordered = sorted(result.scores, key=lambda item: (-item.score, item.index))
+        ordered = sorted(result.data, key=lambda item: (-item.score, item.index))
         candidates = list(self.candidates.items())
         chunks = []
         for item in ordered[:top_k]:
@@ -173,7 +156,7 @@ class SearchTrajectory:
         usage = RerankingUsage(
             model=result.model,
             candidate_count=len(candidates),
-            input_tokens=result.input_tokens,
+            input_tokens=result.usage.prompt_tokens,
             duration_ms=(time.perf_counter() - started) * 1000,
         )
         return chunks, usage

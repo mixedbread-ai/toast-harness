@@ -20,11 +20,13 @@ from pathlib import Path
 from typing import Any
 
 import openai
-from mixedbread import AsyncMixedbread
+from dotenv import load_dotenv
 from scoring import score
 
 import agent_harness
 from agent_harness import apply_force_submit
+
+load_dotenv(Path(__file__).with_name(".env"), override=False)
 
 BASE_URL = os.environ.get("TOAST_MODEL_BASE_URL", "http://127.0.0.1:30000/v1")
 SERVED_MODEL = os.environ.get("TOAST_SERVED_MODEL", "policy")
@@ -43,28 +45,6 @@ ANSWER_MODE = os.environ.get("TOAST_ANSWER_MODE", "none")
 # require_tool_calls, num_retries, reasoning_effort) that are not wire params.
 # Translating it is the caller's job -- that is the seam.
 WIRE_KEYS = ("tool_choice", "parallel_tool_calls")
-
-
-class MixedbreadReranker:
-    def __init__(self, model: str):
-        self.model = model
-
-    async def rerank(self, request: agent_harness.RerankRequest) -> agent_harness.RerankResult:
-        async with AsyncMixedbread(api_key=os.environ["MXBAI_API_KEY"]) as client:
-            result = await client.rerank(
-                model=self.model,
-                query=request.query,
-                input=request.documents,
-                top_k=len(request.documents),
-            )
-        return agent_harness.RerankResult(
-            scores=tuple(
-                agent_harness.RerankScore(index=item.index, score=item.score)
-                for item in result.data
-            ),
-            model=result.model,
-            input_tokens=result.usage.prompt_tokens,
-        )
 
 
 def build_generation_fn(client: openai.OpenAI, record: list[dict[str, Any]]):
@@ -123,17 +103,14 @@ def main() -> int:
     )
     parser.add_argument("out_dir", type=Path)
     parser.add_argument("queries", type=Path)
-    parser.add_argument("--strict-top-k", action="store_true", help="Request ten ranked chunks.")
     parser.add_argument(
-        "--rerank-model",
-        metavar="MODEL",
-        help="Rerank all observed evidence with this Mixedbread model. Enables strict top-k.",
+        "--strict-top-k",
+        action="store_true",
+        help="Rerank the observed evidence with Mixedbread and return up to ten chunks.",
     )
     args = parser.parse_args()
-    strict_top_k = args.strict_top_k or args.rerank_model is not None
-    if strict_top_k and ANSWER_MODE == "plain_text":
+    if args.strict_top_k and ANSWER_MODE == "plain_text":
         parser.error("Strict top-k requires a ranking answer mode.")
-    reranker = MixedbreadReranker(args.rerank_model) if args.rerank_model else None
 
     out_dir = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -164,8 +141,7 @@ def main() -> int:
                 item["query"],
                 store_identifiers=[STORE],
                 top_k=None if ANSWER_MODE == "plain_text" else TOP_K,
-                strict_top_k=strict_top_k,
-                **({"reranker": reranker} if reranker is not None else {}),
+                strict_top_k=args.strict_top_k,
                 generation_fn=build_generation_fn(client, calls),
                 query_id=query_id,
                 answer_mode=ANSWER_MODE,
