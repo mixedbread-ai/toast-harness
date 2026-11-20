@@ -50,7 +50,7 @@ async def run_searcher_async(
     store_identifiers: Sequence[str],
     generation_fn: AsyncGenerationFn | None,
     top_k: int | None = None,
-    strict_top_k: bool = STRICT_TOPK,
+    strict_top_k: bool | None = STRICT_TOPK,
     client: AsyncRetrievalClient | None = None,
     api_key: str | None = None,
     api_key_env: str | None = None,
@@ -110,7 +110,7 @@ class SearcherExecutionPolicy:
         *,
         store_identifiers: Sequence[str],
         top_k: int | None = None,
-        strict_top_k: bool = STRICT_TOPK,
+        strict_top_k: bool | None = STRICT_TOPK,
         client: RetrievalClient | None = None,
         api_key: str | None = None,
         api_key_env: str | None = None,
@@ -150,7 +150,7 @@ def run_searcher(
     *,
     store_identifiers: Sequence[str],
     top_k: int | None = None,
-    strict_top_k: bool = STRICT_TOPK,
+    strict_top_k: bool | None = STRICT_TOPK,
     client: RetrievalClient | None = None,
     api_key: str | None = None,
     api_key_env: str | None = None,
@@ -226,6 +226,8 @@ def build_rollout_result(
         "retrieval": retrieval,
         "answer_mode": result.get("answer_mode", "none"),
     }
+    if result.get("reranking") is not None:
+        record["submission"] = jsonable(result["ranking"])
     if retrieval.get("answer"):
         record["answer"] = retrieval["answer"]
     return record
@@ -236,6 +238,7 @@ def build_retrieval(result: Mapping[str, Any]) -> dict[str, Any]:
         {
             "ranked_ids": ranked_ids(result),
             "chunks": list(result.get("chunks") or []),
+            "reranking": result.get("reranking"),
             "answer": result.get("answer"),
             "ranking_strategy": result.get("ranking_strategy"),
             "top_k": result.get("top_k"),

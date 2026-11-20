@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import json
+
+import httpx
+import mixedbread
 import pytest
+
+from agent_harness import reranking
 
 
 @pytest.fixture(autouse=True)
@@ -26,3 +32,33 @@ def _hermetic_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MBREAD_API_KEY", raising=False)
     monkeypatch.delenv("MIXEDBREAD_API_KEY", raising=False)
     monkeypatch.setenv("MXBAI_API_KEY", "test-suite-dummy-key")
+
+
+@pytest.fixture(autouse=True)
+def listwise_requests(monkeypatch):
+    """Run strict-mode replays through the SDK with an in-process HTTP transport."""
+    requests = []
+
+    def handle(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        assert body["model"] == "mixedbread-ai/mxbai-rerank-v3.1-listwise"
+        assert body["top_k"] == len(body["input"])
+        return httpx.Response(
+            200,
+            json={
+                "model": body["model"],
+                "top_k": body["top_k"],
+                "return_input": False,
+                "data": [{"index": i, "score": float(i)} for i in range(body["top_k"])],
+                "usage": {"prompt_tokens": 42, "total_tokens": 42},
+            },
+        )
+
+    def client(**kwargs):
+        return mixedbread.AsyncMixedbread(
+            **kwargs, http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle))
+        )
+
+    monkeypatch.setattr(reranking, "AsyncMixedbread", client)
+    return requests

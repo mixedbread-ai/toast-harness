@@ -62,6 +62,13 @@ def main() -> int:
         "--answer-mode", choices=("none", "submit_ranking", "plain_text"), default="none"
     )
     parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument(
+        "--no-strict-top-k",
+        dest="strict_top_k",
+        action="store_false",
+        default=None,
+        help="Use Toast's original ranking.",
+    )
     parser.add_argument("--out", help="write the full rollout record here")
     parser.add_argument("--api-key", help="Mixedbread API key; defaults to MXBAI_API_KEY")
     args = parser.parse_args()
@@ -82,6 +89,8 @@ def main() -> int:
     result = agent_harness.run_searcher(
         args.query,
         store_identifiers=[args.store],
+        api_key=api_key,
+        strict_top_k=args.strict_top_k,
         top_k=None if args.answer_mode == "plain_text" else args.top_k,
         generation_fn=build_generation_fn(client),
         answer_mode=args.answer_mode,

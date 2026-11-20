@@ -62,10 +62,21 @@ def _golden(name: str) -> dict:
     return json.loads(resource.read_text(encoding="utf-8"))
 
 
+def _expected_live_tools(contract: dict) -> list[dict]:
+    # The published v1 fixture retains its original overview width.
+    tools = [dict(tool) for tool in contract["tools"]]
+    overview = next(tool for tool in tools if tool["name"] == "overview_search")
+    assert "up to 25 relevant chunks" in overview["description"]
+    overview["description"] = overview["description"].replace(
+        "up to 25 relevant chunks", "up to 50 relevant chunks"
+    )
+    return tools
+
+
 def test_fast_searcher_contract_matches_live_tool_order_and_schema() -> None:
     contract = build_searcher_contract(top_k=5, strict_top_k=True)
     live_tools = _searcher_tools(top_k=5, strict_top_k=True)
-    assert contract["tools"] == [tool["function"] for tool in live_tools]
+    assert _expected_live_tools(contract) == [tool["function"] for tool in live_tools]
     assert contract["initialization_stages"] == [
         "initial_metadata",
         "initial_search",
@@ -101,7 +112,7 @@ def test_exported_tools_carry_no_provider_specific_envelope() -> None:
     assert all(set(tool) == {"name", "description", "parameters"} for tool in contract["tools"])
     assert all(set(tool) == {"type", "function"} for tool in live_tools)
     assert all(tool["type"] == "function" for tool in live_tools)
-    assert contract["tools"] == [tool["function"] for tool in live_tools]
+    assert _expected_live_tools(contract) == [tool["function"] for tool in live_tools]
 
 
 def test_tool_result_wire_names_the_in_package_serialization() -> None:

@@ -161,11 +161,9 @@ class MetadataFilterExpression(BaseModel):
     any: list[MetadataFilter] | None = None
     none: list[MetadataFilter] | None = None
 
-    @model_validator(mode="after")
-    def require_clause_group(self) -> MetadataFilterExpression:
-        if not (self.all or self.any or self.none):
-            raise ValueError("metadata_filter must include all, any, or none")
-        return self
+    def is_empty(self) -> bool:
+        # Policies send {} or {"all": []} for "no filter"; the filter builder reads it as None.
+        return not (self.all or self.any or self.none)
 
 
 class InspectMetadataArgs(BaseModel):
@@ -270,6 +268,13 @@ class FilterChunksArgs(BaseModel):
     direction: Literal["asc", "desc"] = "desc"
     k: int = Field(default=FILTER_CHUNKS_DEFAULT_K, ge=1, le=FILTER_CHUNKS_MAX_K)
 
+    @field_validator("k", mode="before")
+    @classmethod
+    def cap_requested_k(cls, value: Any) -> Any:
+        if type(value) is int:
+            return min(value, FILTER_CHUNKS_MAX_K)
+        return value
+
     @field_validator("rank_by")
     @classmethod
     def strip_rank_by(cls, rank_by: str | None) -> str | None:
@@ -331,7 +336,9 @@ class FilterMetadataArgs(BaseModel):
 
     @model_validator(mode="after")
     def require_filter(self) -> FilterMetadataArgs:
-        if not self.metadata_filters and self.metadata_filter is None:
+        if not self.metadata_filters and (
+            self.metadata_filter is None or self.metadata_filter.is_empty()
+        ):
             raise ValueError("filter_metadata requires metadata_filters or metadata_filter")
         return self
 

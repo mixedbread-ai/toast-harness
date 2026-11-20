@@ -17,7 +17,9 @@ import replay_scenarios as rs
 
 from agent_harness import HarnessTuning, run_searcher
 from agent_harness import config as harness_config
+from agent_harness.agents.shared import parse_tool_args
 from agent_harness.llm import response_message_to_dict
+from agent_harness.schemas import FilterChunksArgs
 from agent_harness.sync_api import run_fast_agentic_search
 from agent_harness.testing import ScriptedGeneration
 
@@ -184,3 +186,18 @@ def test_as_of_survives_the_searcher_tuning_reentry() -> None:
 
     assert seen_system_prompts
     assert all("Current UTC date: 1999-12-31." in prompt for prompt in seen_system_prompts)
+
+
+def test_search_overfetch_factor_overrides_default_but_yields_to_corpus_limit():
+    with harness_config.tuning_setting(HarnessTuning(search_overfetch_factor=1)):
+        assert harness_config.corpus_backend_top_k() == harness_config.SEARCH_CORPUS_TOP_K
+    with harness_config.tuning_setting(HarnessTuning(search_overfetch_factor=2, backend_top_k=17)):
+        assert harness_config.corpus_backend_top_k() == 17
+        assert harness_config.search_overfetch_factor() == 2
+    assert harness_config.search_overfetch_factor() == harness_config.SEARCH_OVERFETCH_FACTOR
+
+
+def test_filter_chunks_caps_the_last_requested_k():
+    arguments = '{"k": 1, "k": 900}'
+    call = SimpleNamespace(function=SimpleNamespace(name="filter_chunks", arguments=arguments))
+    assert parse_tool_args(call, FilterChunksArgs).k == harness_config.FILTER_CHUNKS_MAX_K

@@ -99,23 +99,17 @@ def chunk_with_reference_ids(
     return payload
 
 
-def validate_ranked_chunk_ids(
-    ranking: FinalChunkSubmission,
-    index: ChunkIndex,
-    *,
-    top_k: int | None = None,
-    strict_top_k: bool = False,
-    tool_name: str = "submit_ranking",
-) -> None:
-    if strict_top_k and top_k is not None and len(ranking.chunks) != top_k:
-        raise ValueError(
-            f"{tool_name}.chunks must contain exactly {top_k} chunks; got {len(ranking.chunks)}"
-        )
+def validate_ranked_chunk_ids(ranking: FinalChunkSubmission, index: ChunkIndex) -> None:
+    """Reject a submission that names chunk ids the agent has not seen.
+
+    The chunk count is never checked: strict top_k asks the model for exactly
+    ``top_k`` chunks, but a rollout can only rank what it retrieved, so a
+    shorter submission stands and a longer one is clipped by ``finalize_chunks``.
+    """
     valid_chunk_ids = set(index.visible_chunk_ids())
-    unavailable_ids: list[str] = []
-    for ranked in ranking.chunks:
-        if ranked.chunk_id not in valid_chunk_ids:
-            unavailable_ids.append(ranked.chunk_id)
+    unavailable_ids = [
+        ranked.chunk_id for ranked in ranking.chunks if ranked.chunk_id not in valid_chunk_ids
+    ]
     if unavailable_ids:
         raise ValueError("Unknown or unavailable chunk_id values: " + ", ".join(unavailable_ids))
 

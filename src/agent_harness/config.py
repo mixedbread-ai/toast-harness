@@ -21,7 +21,7 @@ INITIAL_SEARCH_TOP_K = 5
 # higher GET_CHUNKS_CHUNK_TOKEN_LIMIT, and every tool's call total is bounded
 # by TOOL_CALL_PAYLOAD_TOKEN_BUDGET below.
 SEARCH_CHUNK_TOKEN_LIMIT = 2000
-OVERVIEW_SEARCH_TOP_K = 25
+OVERVIEW_SEARCH_TOP_K = 50
 SEARCH_OVERFETCH_FACTOR = 5
 
 
@@ -41,8 +41,11 @@ class HarnessTuning:
     tool_choice: str | None = None
     keep_reasoning_history: bool | None = None
     searcher_max_rounds: int | None = None
+    search_overfetch_factor: int | None = None
 
     def __post_init__(self) -> None:
+        if self.search_overfetch_factor is not None and self.search_overfetch_factor < 1:
+            raise ValueError("search_overfetch_factor must be at least 1")
         if self.backend_top_k is not None and self.backend_top_k < SEARCH_CORPUS_TOP_K:
             msg = f"backend_top_k must be at least SEARCH_CORPUS_TOP_K ({SEARCH_CORPUS_TOP_K})"
             raise ValueError(msg)
@@ -92,20 +95,17 @@ def _env_corpus_backend_top_k() -> int:
 
 
 def corpus_backend_top_k() -> int:
-    """Candidates requested from Mixedbread for each search_corpus call.
-
-    Kept separate from SEARCH_OVERFETCH_FACTOR: that factor also controls grep
-    and overview_search, while latency benchmarks need to vary only the
-    search_corpus provider request without changing any agent-visible limits.
-    A per-rollout ``HarnessTuning.backend_top_k`` wins; otherwise the value is
-    read from AGENT_HARNESS_CORPUS_BACKEND_TOP_K on first use and frozen for
-    the process, so a bad deployment value is a configuration error raised at
-    the first search rather than out of `import agent_harness`.
-    """
-    override = current_tuning().backend_top_k
-    if override is not None:
-        return override
+    """An explicit corpus limit wins over the rollout factor and deployment default."""
+    tuning = current_tuning()
+    if tuning.backend_top_k is not None:
+        return tuning.backend_top_k
+    if tuning.search_overfetch_factor is not None:
+        return SEARCH_CORPUS_TOP_K * tuning.search_overfetch_factor
     return _env_corpus_backend_top_k()
+
+
+def search_overfetch_factor() -> int:
+    return current_tuning().search_overfetch_factor or SEARCH_OVERFETCH_FACTOR
 
 
 @functools.lru_cache(maxsize=1)
@@ -290,7 +290,7 @@ type MediaContentMode = Literal["auto", "always", "never"]
 type MediaContentInput = MediaContentMode | bool | None
 
 MEDIA_CONTENT_MODES: tuple[MediaContentMode, ...] = ("auto", "always", "never")
-STRICT_TOPK = False
+STRICT_TOPK: bool | None = None  # Infer strict ranking from an explicit top_k.
 
 # Per-rollout setting, not process state: callers run rollouts concurrently,
 # each with its own media_content. A ContextVar gives every thread (and every

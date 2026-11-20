@@ -9,6 +9,7 @@ a generation_fn honoring completion_config/force_submit, and run_searcher.
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -19,9 +20,13 @@ from pathlib import Path
 from typing import Any
 
 import openai
+from dotenv import load_dotenv
+from scoring import score
 
 import agent_harness
 from agent_harness import apply_force_submit
+
+load_dotenv(Path(__file__).with_name(".env"), override=False)
 
 BASE_URL = os.environ.get("TOAST_MODEL_BASE_URL", "http://127.0.0.1:30000/v1")
 SERVED_MODEL = os.environ.get("TOAST_SERVED_MODEL", "policy")
@@ -93,9 +98,23 @@ def build_generation_fn(client: openai.OpenAI, record: list[dict[str, Any]]):
 
 
 def main() -> int:
-    out_dir = Path(sys.argv[1])
+    parser = argparse.ArgumentParser(
+        description="Run BrowseComp-Plus queries against a served model."
+    )
+    parser.add_argument("out_dir", type=Path)
+    parser.add_argument("queries", type=Path)
+    parser.add_argument(
+        "--strict-top-k",
+        action=argparse.BooleanOptionalAction,
+        help="Use final listwise reranking (default for ranking modes).",
+    )
+    args = parser.parse_args()
+    if args.strict_top_k and ANSWER_MODE == "plain_text":
+        parser.error("Strict top-k requires a ranking answer mode.")
+
+    out_dir = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    queries = json.loads(Path(sys.argv[2]).read_text())
+    queries = json.loads(args.queries.read_text())
 
     logging.basicConfig(
         level=logging.INFO,
@@ -116,15 +135,19 @@ def main() -> int:
         started = time.time()
         error: str | None = None
         result: dict[str, Any] | None = None
+        metrics: dict[str, Any] = {}
         try:
             result = agent_harness.run_searcher(
                 item["query"],
                 store_identifiers=[STORE],
                 top_k=None if ANSWER_MODE == "plain_text" else TOP_K,
+                strict_top_k=args.strict_top_k,
                 generation_fn=build_generation_fn(client, calls),
                 query_id=query_id,
                 answer_mode=ANSWER_MODE,
             )
+            if ANSWER_MODE != "plain_text" and item.get("relevant_ids") is not None:
+                metrics = score(result["retrieval"], item["relevant_ids"])
         except Exception as exc:  # recorded per query, never swallowed
             error = traceback.format_exc()
             print(f"query {query_id} FAILED: {exc}", flush=True)
@@ -136,30 +159,33 @@ def main() -> int:
             )
         agent = ((result or {}).get("openai", {}).get("metadata", {}) or {}).get("agent", {}) or {}
         retrieval = (result or {}).get("retrieval", {}) or {}
-        summaries.append(
-            {
-                "query_id": query_id,
-                "error": error,
-                "wall_s": wall_s,
-                "ranked_ids": list(retrieval.get("ranked_ids") or []),
-                "ranking_strategy": retrieval.get("ranking_strategy"),
-                "answer": retrieval.get("answer"),
-                "rounds_executed": agent.get("rounds_executed"),
-                "forced_ranking": agent.get("forced_ranking"),
-                "total_tokens": agent.get("total_tokens"),
-                "input_tokens": agent.get("input_tokens"),
-                "output_tokens": agent.get("output_tokens"),
-                "trace_counts": agent.get("trace_counts"),
-                "provider_failure_count": agent.get("provider_failure_count"),
-                "generation_calls": calls,
-            }
-        )
-        print(f"query {query_id} done in {wall_s:.1f}s", flush=True)
+        summary = {
+            "query_id": query_id,
+            "error": error,
+            "wall_s": wall_s,
+            "ranked_ids": list(retrieval.get("ranked_ids") or []),
+            **metrics,
+            "ranking_strategy": retrieval.get("ranking_strategy"),
+            "answer": retrieval.get("answer"),
+            "rounds_executed": agent.get("rounds_executed"),
+            "forced_ranking": agent.get("forced_ranking"),
+            "total_tokens": agent.get("total_tokens"),
+            "input_tokens": agent.get("input_tokens"),
+            "output_tokens": agent.get("output_tokens"),
+            "trace_counts": agent.get("trace_counts"),
+            "provider_failure_count": agent.get("provider_failure_count"),
+            "generation_calls": calls,
+        }
+        if result and "reranking" in retrieval:
+            summary.update(reranking=retrieval["reranking"], submission=result["submission"])
+        summaries.append(summary)
+        if error is None:
+            print(f"query {query_id} done in {wall_s:.1f}s", flush=True)
 
     (out_dir / "client_summary.json").write_text(
         json.dumps(summaries, indent=2, sort_keys=True, default=str) + "\n"
     )
-    return 0
+    return int(any(row["error"] is not None for row in summaries))
 
 
 if __name__ == "__main__":

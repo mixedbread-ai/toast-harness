@@ -68,7 +68,7 @@ def build_searcher_contract(
 
     final_tool = submit_ranking_tool(top_k=top_k, strict_top_k=strict_top_k)
     provider_tools = [
-        overview_search_tool(),
+        overview_search_tool(top_k=25),  # Published v1 tool description.
         search_corpus_tool(),
         filter_chunks_tool(),
         grep_tool(),
