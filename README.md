@@ -260,6 +260,10 @@ texts to the Mixedbread rerank API using `mixedbread-ai/mxbai-rerank-v3.1-listwi
 This includes evidence shown earlier and later pruned. The rerank call needs a
 Mixedbread API key and works with candidates from any retrieval backend.
 
+In our evaluations, the listwise reranker improved retrieval quality over Toast’s
+original ranking. It can promote relevant chunks that Toast found during search
+but left out of its final submission.
+
 On a reranked `run_searcher` rollout, `result["submission"]` holds Toast's
 original ranking, `result["retrieval"]["chunks"]` holds the delivered chunks,
 and `result["retrieval"]["reranking"]` records the reranker model, candidate
