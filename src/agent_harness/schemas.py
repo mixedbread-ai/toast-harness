@@ -11,7 +11,6 @@ from agent_harness.config import (
     FILTER_CHUNKS_MAX_K,
     GET_CHUNKS_MAX_CHUNK_IDS,
     READ_DOCUMENT_MAX_WINDOW,
-    current_tuning,
 )
 
 ChunkKey = tuple[str, str, int]
@@ -271,8 +270,8 @@ class FilterChunksArgs(BaseModel):
 
     @field_validator("k", mode="before")
     @classmethod
-    def clamp_production_k(cls, value: Any) -> Any:
-        if type(value) is int and current_tuning().mode == "production":
+    def cap_requested_k(cls, value: Any) -> Any:
+        if type(value) is int:
             return min(value, FILTER_CHUNKS_MAX_K)
         return value
 

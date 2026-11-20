@@ -42,11 +42,8 @@ class HarnessTuning:
     keep_reasoning_history: bool | None = None
     searcher_max_rounds: int | None = None
     search_overfetch_factor: int | None = None
-    mode: Literal["production", "training"] | None = None
 
     def __post_init__(self) -> None:
-        if self.mode not in (None, "production", "training"):
-            raise ValueError("mode must be 'production' or 'training'")
         if self.search_overfetch_factor is not None and self.search_overfetch_factor < 1:
             raise ValueError("search_overfetch_factor must be at least 1")
         if self.backend_top_k is not None and self.backend_top_k < SEARCH_CORPUS_TOP_K:

@@ -197,12 +197,7 @@ def test_search_overfetch_factor_overrides_default_but_yields_to_corpus_limit():
     assert harness_config.search_overfetch_factor() == harness_config.SEARCH_OVERFETCH_FACTOR
 
 
-def test_tool_argument_modes_handle_duplicate_keys_and_oversized_k():
+def test_filter_chunks_caps_the_last_requested_k():
     arguments = '{"k": 1, "k": 900}'
     call = SimpleNamespace(function=SimpleNamespace(name="filter_chunks", arguments=arguments))
-    with harness_config.tuning_setting(HarnessTuning(mode="production")):
-        assert parse_tool_args(call, FilterChunksArgs).k == harness_config.FILTER_CHUNKS_MAX_K
-    with harness_config.tuning_setting(HarnessTuning(mode="training")):
-        assert "Duplicate argument key" in parse_tool_args(call, FilterChunksArgs)["error"]
-        call.function.arguments = '{"k": 900}'
-        assert "error" in parse_tool_args(call, FilterChunksArgs)
+    assert parse_tool_args(call, FilterChunksArgs).k == harness_config.FILTER_CHUNKS_MAX_K

@@ -576,21 +576,6 @@ def failed_generation_response(
     )
 
 
-def load_tool_arguments(arguments: str) -> Any:
-    if current_tuning().mode == "training":
-        return json.loads(arguments, object_pairs_hook=_unique_keys)
-    return json.loads(arguments)
-
-
-def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"Duplicate argument key: {key}")
-        result[key] = value
-    return result
-
-
 def parse_ranking(arguments: str, *, require_answer: bool = False) -> RankedChunkList:
     """Parse a ``submit_ranking`` payload.
 
@@ -598,10 +583,7 @@ def parse_ranking(arguments: str, *, require_answer: bool = False) -> RankedChun
     carries the ``answer`` field and rejects a payload that omits it.
     """
     ranking_model = AnsweredRankedChunkList if require_answer else RankedChunkList
-    if current_tuning().mode == "training":
-        ranking = ranking_model.model_validate(load_tool_arguments(arguments))
-    else:
-        ranking = ranking_model.model_validate_json(arguments)
+    ranking = ranking_model.model_validate_json(arguments)
     if not ranking.ranking_strategy:
         raise ValueError("submit_ranking missing ranking_strategy")
     if require_answer and not ranking.answer:
